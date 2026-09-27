@@ -15,6 +15,17 @@ gc570d-y := \
 
 KERNEL_RELEASE ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KERNEL_RELEASE)/build
+
+# Match the kernel's toolchain. A kernel built with clang (CONFIG_CC_IS_CLANG=y,
+# e.g. CachyOS) passes clang-only flags to the compiler, so a module built with
+# the default GCC fails on options such as -mstack-alignment=8. Auto-select the
+# LLVM toolchain unless the caller already chose one (make LLVM=1 / CC=...).
+KERNEL_AUTOCONF := $(KDIR)/include/config/auto.conf
+ifeq ($(shell grep -qs '^CONFIG_CC_IS_CLANG=y' $(KERNEL_AUTOCONF) && echo 1),1)
+LLVM ?= 1
+endif
+export LLVM
+
 INSTALL_MOD_DIR ?= extra/gc570d
 NO_SIGNAL_SOURCE := assets/no-signal.png
 NO_SIGNAL_DATA := data/gc570d_no_signal_640x360.inc

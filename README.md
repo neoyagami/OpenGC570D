@@ -13,6 +13,14 @@ official AVerMedia project and is not endorsed by AVerMedia. Read
 [`NOTICE.md`](NOTICE.md) and [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)
 before redistributing it.
 
+> **Fork note:** this is a fork maintained by
+> [@eliseohh](https://github.com/eliseohh), forked from
+> [neoyagami/OpenGC570D](https://github.com/neoyagami/OpenGC570D). The driver
+> source is upstream's and unchanged; the only addition is the verified
+> CachyOS/Arch build note under
+> [Verified configurations](#verified-configurations). Upstream remains the
+> canonical project.
+
 ## Why this project exists
 
 The GC570D had no Linux driver that provided the functions I needed. This
@@ -62,6 +70,25 @@ Recovered but not yet fully validated: the remaining 1080p-or-lower input
 matrix, including 720x576, every source/monitor combination, VRR, and all
 advertised refresh rates. HDCP-protected content is unsupported. Capture
 output is SDR, capped at 60 fps, and no larger than 1920x1080.
+
+## Verified configurations
+
+Independent reproductions of the driver on other distributions:
+
+| Distribution | Kernel | Compiler | Secure Boot | Result |
+| --- | --- | --- | --- | --- |
+| CachyOS (Arch-based) | `7.2.2-1-cachyos` (clang-built) | clang 22.1.8 | disabled | `1461:0054`/`1461:5700` binds; HDMI IN 2 capture, both ALSA capture devices and the RGB LED verified |
+
+Build note for clang-built kernels: these kernels pass clang-only flags
+(`-mstack-alignment=8`, `-mretpoline-external-thunk`, ...) that GCC rejects.
+The Makefile reads the target kernel's `include/config/auto.conf` and selects
+the LLVM toolchain automatically when `CONFIG_CC_IS_CLANG=y`, so plain `make`
+works; `make LLVM=1` still forces it explicitly:
+
+```sh
+make                 # auto-selects LLVM on clang-built kernels
+sudo ./scripts/gc570d-load.sh
+```
 
 ## Testing help wanted
 
