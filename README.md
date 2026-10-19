@@ -13,7 +13,7 @@ official AVerMedia project and is not endorsed by AVerMedia. Read
 [`NOTICE.md`](NOTICE.md) and [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)
 before redistributing it.
 
-> **Fork note:** this is a fork maintained by
+> **Fork note:** this repo has a fork maintained by
 > [@eliseohh](https://github.com/eliseohh), forked from
 > [neoyagami/OpenGC570D](https://github.com/neoyagami/OpenGC570D). The driver
 > source is upstream's and unchanged; the only addition is the verified
