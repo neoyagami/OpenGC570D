@@ -24,6 +24,49 @@ static bool gc570d_video_is_no_signal_error(int ret)
 	       ret == -EINVAL || ret == -EILSEQ || ret == -EOPNOTSUPP;
 }
 
+static u16 gc570d_video_interval_rate(u32 frame_interval)
+{
+	return frame_interval == 200000 ? 50 : 60;
+}
+
+/*
+ * Prefer the rate measured from the connected source.  The negotiated table
+ * interval is only a fallback because an application may keep the default
+ * 1080p format while the source runs at 50 Hz.  HDMI IN 1's capture path caps
+ * higher-rate inputs at 60 fps; HDMI IN 2 only scales spatially.
+ */
+static u16 gc570d_video_source_rate(struct gc570d_dev *gc, bool hdmi0)
+{
+	u16 rate;
+
+	if (hdmi0) {
+		rate = READ_ONCE(gc->video0_input_frame_rate);
+		if (!rate || READ_ONCE(gc->video0_no_signal))
+			rate = gc570d_video_interval_rate(gc->video0_frame_interval);
+		/* VIP0 capture is capped at 60 fps even for higher-rate inputs. */
+		if (rate > 60)
+			rate = 60;
+	} else {
+		rate = READ_ONCE(gc->video_input_frame_rate);
+		if (!rate || READ_ONCE(gc->video_no_signal))
+			rate = gc570d_video_interval_rate(gc->video_frame_interval);
+	}
+	return rate;
+}
+
+/*
+ * HDMI IN 1 keeps both fields in a woven 1080-line buffer, so advertise it as
+ * interlaced.  HDMI IN 2 reconstructs a progressive frame from each field in
+ * VIP1, so its output is genuinely progressive.
+ */
+static u32 gc570d_video_field(struct gc570d_dev *gc, bool hdmi0)
+{
+	if (hdmi0 && !READ_ONCE(gc->video0_no_signal) &&
+	    READ_ONCE(gc->video0_input_interlaced))
+		return V4L2_FIELD_INTERLACED;
+	return V4L2_FIELD_NONE;
+}
+
 static u8 *gc570d_no_signal_frame_create(u16 width, u16 height)
 {
 	const u32 source_width = GC570D_NO_SIGNAL_WIDTH;
@@ -155,10 +198,15 @@ static void gc570d_video_return_buffers(struct gc570d_dev *gc,
 	}
 }
 
+static size_t gc570d_video_frame_size(const struct gc570d_dev *gc)
+{
+	return (size_t)gc->video_width * gc->video_height * 2;
+}
+
 static int gc570d_video_switch_to_no_signal(struct gc570d_dev *gc)
 {
-	u8 *frame = gc570d_no_signal_frame_create(GC570D_WIDTH,
-						   GC570D_HEIGHT);
+	u8 *frame = gc570d_no_signal_frame_create(gc->video_width,
+						   gc->video_height);
 
 	if (IS_ERR(frame))
 		return PTR_ERR(frame);
@@ -270,6 +318,24 @@ static int gc570d_video_try_recover_live(struct gc570d_dev *gc,
 
 	*no_scdt_polls = 0;
 	*hpd_retry_ns = 0;
+	{
+		u16 live_w = 0;
+		u16 live_h = 0;
+		bool live_i = false;
+
+		ret = gc570d_dma_detect_vip1_format(gc, &live_w, &live_h,
+						    &live_i);
+		if (ret)
+			goto out_link_changed;
+		if (*scdt_stable_polls > 0 &&
+		    (live_w != gc->video_input_width ||
+		     live_h != gc->video_input_height ||
+		     live_i != gc->video_input_interlaced))
+			*scdt_stable_polls = 0;
+		gc->video_input_width = live_w;
+		gc->video_input_height = live_h;
+		gc->video_input_interlaced = live_i;
+	}
 	if (++(*scdt_stable_polls) < GC570D_HDMI2_SCDT_STABLE_POLLS) {
 		ret = 0;
 		goto out_unlock;
@@ -288,9 +354,6 @@ static int gc570d_video_try_recover_live(struct gc570d_dev *gc,
 	ret = gc570d_it6802_format_init(gc);
 	if (ret)
 		goto out_link_changed;
-	ret = gc570d_vip_init(gc);
-	if (ret)
-		goto out_link_changed;
 	/* StableOutput mutes the receiver; restore an independently open PCM. */
 	if (gc->audio_prepared) {
 		audio_ret = gc570d_it6802_audio_output_set(gc, true);
@@ -299,6 +362,9 @@ static int gc570d_video_try_recover_live(struct gc570d_dev *gc,
 				"HDMI IN 2 video recovered but audio restore is pending: %d\n",
 				audio_ret);
 	}
+	ret = gc570d_vip_init(gc);
+	if (ret)
+		goto out_link_changed;
 	if (readl(gc->bar0 + GC570D_DMA_DESC_CONTROL) & 0x1f) {
 		ret = -EBUSY;
 		goto out_warn;
@@ -386,9 +452,11 @@ static int gc570d_video_thread(void *data)
 	dma_addr_t frame_dma;
 	u64 no_signal_deadline = 0;
 	u64 next_link_poll_ns = 0;
+	u64 next_format_poll_ns = 0;
 	u64 hpd_retry_ns = 0;
 	unsigned int no_scdt_polls = 0;
 	unsigned int scdt_stable_polls = 0;
+	unsigned int format_change_polls = 0;
 	unsigned int dma_poll;
 	u32 hardware_index;
 	int ret;
@@ -411,8 +479,12 @@ static int gc570d_video_thread(void *data)
 						     &hpd_retry_ns);
 			next_link_poll_ns = ktime_get_ns() +
 				GC570D_HDMI2_LINK_POLL_NS;
-			if (ret > 0)
+			if (ret > 0) {
 				no_signal_deadline = 0;
+				format_change_polls = 0;
+				next_format_poll_ns = ktime_get_ns() +
+					2 * GC570D_HDMI2_LINK_POLL_NS;
+			}
 		}
 
 		spin_lock_irqsave(&gc->video_qlock, flags);
@@ -426,8 +498,8 @@ static int gc570d_video_thread(void *data)
 		spin_unlock_irqrestore(&gc->video_qlock, flags);
 
 		if (READ_ONCE(gc->video_no_signal)) {
-			gc570d_no_signal_pace(GC570D_NO_SIGNAL_INTERVAL,
-					       &no_signal_deadline);
+			gc570d_no_signal_pace(gc->video_frame_interval,
+					      &no_signal_deadline);
 			if (READ_ONCE(gc->video_stopping) ||
 			    kthread_should_stop()) {
 				vb2_buffer_done(&buffer->vb.vb2_buf,
@@ -436,7 +508,7 @@ static int gc570d_video_thread(void *data)
 			}
 			ret = gc570d_no_signal_complete(buffer,
 						gc->video_no_signal_frame,
-						GC570D_DMA_FRAME_SIZE,
+						gc570d_video_frame_size(gc),
 						gc->video_sequence++);
 			if (ret) {
 				vb2_buffer_done(&buffer->vb.vb2_buf,
@@ -453,7 +525,7 @@ static int gc570d_video_thread(void *data)
 		gc->video_sg_cpu[0] = cpu_to_le32(lower_32_bits(frame_dma));
 		gc->video_sg_cpu[1] = cpu_to_le32(upper_32_bits(frame_dma));
 		gc->video_sg_cpu[2] =
-			cpu_to_le32(GC570D_DMA_FRAME_SIZE / sizeof(u32));
+			cpu_to_le32(gc570d_video_frame_size(gc) / sizeof(u32));
 		gc->video_sg_cpu[3] = cpu_to_le32(0x80006000);
 		dma_wmb();
 
@@ -494,7 +566,8 @@ static int gc570d_video_thread(void *data)
 		}
 
 		hardware_index = readl(gc->bar0 + GC570D_DMA_DESC_INDEX) & 7;
-		if (!completed) {
+		if (!completed || hardware_index != 1 ||
+		    !(READ_ONCE(gc->dma_irq_status) & GC570D_DMA_FRAME_IRQ)) {
 			dev_warn(&gc->pdev->dev,
 				 "HDMI IN 2 DMA timeout snapshot: index=%u irq=0x%08x saved_irq=0x%08x control=0x%08x\n",
 				 hardware_index,
@@ -514,11 +587,11 @@ static int gc570d_video_thread(void *data)
 				no_scdt_polls = 0;
 				scdt_stable_polls = 0;
 				gc570d_no_signal_pace(
-					GC570D_NO_SIGNAL_INTERVAL,
+					gc->video_frame_interval,
 					&no_signal_deadline);
 				ret = gc570d_no_signal_complete(
 					buffer, gc->video_no_signal_frame,
-					GC570D_DMA_FRAME_SIZE,
+					gc570d_video_frame_size(gc),
 					gc->video_sequence++);
 				if (!ret) {
 					vb2_buffer_done(&buffer->vb.vb2_buf,
@@ -526,19 +599,11 @@ static int gc570d_video_thread(void *data)
 					continue;
 				}
 			}
-		}
-
-		if (!completed || hardware_index != 1 ||
-		    !(READ_ONCE(gc->dma_irq_status) & GC570D_DMA_FRAME_IRQ)) {
-			dev_err(&gc->pdev->dev,
-				"V4L2 DMA failed: completion=%lu index=%u irq=0x%08x control=0x%08x\n",
-				completed, hardware_index,
-				READ_ONCE(gc->dma_irq_status),
-				readl(gc->bar0 + GC570D_DMA_DESC_CONTROL));
 			writel(0, gc->bar0 + GC570D_DMA_DESC_CONTROL);
 			vb2_buffer_done(&buffer->vb.vb2_buf,
 					VB2_BUF_STATE_ERROR);
-			vb2_queue_error(&gc->video_queue);
+			if (ret != -ESHUTDOWN)
+				vb2_queue_error(&gc->video_queue);
 			break;
 		}
 
@@ -550,11 +615,50 @@ static int gc570d_video_thread(void *data)
 
 		dma_rmb();
 		buffer->vb.sequence = gc->video_sequence++;
-		buffer->vb.field = V4L2_FIELD_NONE;
+		buffer->vb.field = gc570d_video_field(gc, false);
 		buffer->vb.vb2_buf.timestamp = ktime_get_ns();
 		vb2_set_plane_payload(&buffer->vb.vb2_buf, 0,
-				      GC570D_DMA_FRAME_SIZE);
+				      gc570d_video_frame_size(gc));
 		vb2_buffer_done(&buffer->vb.vb2_buf, VB2_BUF_STATE_DONE);
+
+		if (ktime_get_ns() >= next_format_poll_ns &&
+		    mutex_trylock(&gc->capture_lock)) {
+			u16 live_w = 0;
+			u16 live_h = 0;
+			u16 live_rate = 0;
+			bool live_i = false;
+			int rate_ret;
+			int fmt_ret;
+
+			fmt_ret = gc570d_dma_detect_vip1_format(gc, &live_w,
+								&live_h,
+								&live_i);
+			rate_ret = fmt_ret ? fmt_ret :
+				gc570d_it6802_frame_rate(gc, &live_rate);
+			mutex_unlock(&gc->capture_lock);
+			next_format_poll_ns = ktime_get_ns() +
+				2 * GC570D_HDMI2_LINK_POLL_NS;
+			if (!rate_ret)
+				WRITE_ONCE(gc->video_input_frame_rate,
+					   live_rate);
+			if (fmt_ret || live_w != gc->video_input_width ||
+			    live_h != gc->video_input_height ||
+			    live_i != gc->video_input_interlaced) {
+				if (++format_change_polls >= 2) {
+					format_change_polls = 0;
+					ret = gc570d_video_switch_to_no_signal(gc);
+					if (!ret) {
+						no_signal_deadline = 0;
+						next_link_poll_ns = 0;
+						hpd_retry_ns = 0;
+						no_scdt_polls = 0;
+						scdt_stable_polls = 0;
+					}
+				}
+			} else {
+				format_change_polls = 0;
+			}
+		}
 	}
 
 	return 0;
@@ -566,22 +670,28 @@ static int gc570d_video_queue_setup(struct vb2_queue *queue,
 				     unsigned int sizes[],
 				     struct device *alloc_devs[])
 {
+	struct gc570d_dev *gc = vb2_get_drv_priv(queue);
+	size_t frame_size = gc570d_video_frame_size(gc);
+
 	if (*num_planes) {
-		if (sizes[0] < GC570D_DMA_FRAME_SIZE)
+		if (sizes[0] < frame_size)
 			return -EINVAL;
 		return 0;
 	}
 
 	*num_planes = 1;
-	sizes[0] = GC570D_DMA_FRAME_SIZE;
+	sizes[0] = frame_size;
 	return 0;
 }
 
 static int gc570d_video_buffer_prepare(struct vb2_buffer *vb)
 {
-	if (vb2_plane_size(vb, 0) < GC570D_DMA_FRAME_SIZE)
+	struct gc570d_dev *gc = vb2_get_drv_priv(vb->vb2_queue);
+	size_t frame_size = gc570d_video_frame_size(gc);
+
+	if (vb2_plane_size(vb, 0) < frame_size)
 		return -EINVAL;
-	vb2_set_plane_payload(vb, 0, GC570D_DMA_FRAME_SIZE);
+	vb2_set_plane_payload(vb, 0, frame_size);
 	return 0;
 }
 
@@ -615,18 +725,24 @@ static int gc570d_video_start_streaming(struct vb2_queue *queue,
 		ret = -EBUSY;
 		goto out_return;
 	}
-	if (!gc->audio_prepared) {
-		ret = gc570d_it6802_output_enable(gc);
+	ret = gc570d_it6802_output_enable(gc);
+	if (ret && !gc570d_video_is_no_signal_error(ret))
+		goto out_return;
+	if (ret)
+		no_signal = true;
+	if (!no_signal) {
+		ret = gc570d_it6802_format_init(gc);
 		if (ret && !gc570d_video_is_no_signal_error(ret))
 			goto out_return;
-		if (ret) {
-			no_signal = true;
-		} else {
-			ret = gc570d_it6802_format_init(gc);
-			if (ret && !gc570d_video_is_no_signal_error(ret))
-				goto out_return;
-			no_signal = ret != 0;
-		}
+		no_signal = ret != 0;
+	}
+	if (!no_signal && gc->audio_prepared) {
+		int audio_ret = gc570d_it6802_audio_output_set(gc, true);
+
+		if (audio_ret)
+			dev_warn_ratelimited(&gc->pdev->dev,
+					     "HDMI IN 2 video started but audio restore is pending: %d\n",
+					     audio_ret);
 	}
 	if (!no_signal) {
 		ret = gc570d_vip_init(gc);
@@ -637,8 +753,8 @@ static int gc570d_video_start_streaming(struct vb2_queue *queue,
 
 	if (no_signal) {
 		gc->video_no_signal_frame =
-			gc570d_no_signal_frame_create(GC570D_WIDTH,
-						       GC570D_HEIGHT);
+			gc570d_no_signal_frame_create(gc->video_width,
+						      gc->video_height);
 		if (IS_ERR(gc->video_no_signal_frame)) {
 			ret = PTR_ERR(gc->video_no_signal_frame);
 			gc->video_no_signal_frame = NULL;
@@ -712,7 +828,9 @@ static int gc570d_video_start_streaming(struct vb2_queue *queue,
 	wake_up_interruptible(&gc->video_wait);
 	if (no_signal)
 		dev_info(&gc->pdev->dev,
-			 "HDMI IN 2 has no usable signal; streaming the built-in 1920x1080 placeholder at 60 fps\n");
+			 "HDMI IN 2 has no usable signal; streaming the built-in %ux%u placeholder at %u fps\n",
+			 gc->video_width, gc->video_height,
+			 gc570d_video_source_rate(gc, false));
 	return 0;
 
 out_return:
@@ -751,6 +869,10 @@ static void gc570d_video_stop_streaming(struct vb2_queue *queue)
 	gc->video_stopping = false;
 	gc->video_no_signal = false;
 	gc->video_dma_active = false;
+	gc->video_input_width = 0;
+	gc->video_input_height = 0;
+	gc->video_input_frame_rate = 0;
+	gc->video_input_interlaced = false;
 	if (gc->video_irq_active) {
 		gc570d_video_irq_put_locked(gc);
 		gc->video_irq_active = false;
@@ -777,16 +899,65 @@ static const struct vb2_ops gc570d_video_queue_ops = {
 	.stop_streaming = gc570d_video_stop_streaming,
 };
 
-static void gc570d_video_fill_format(struct v4l2_pix_format *pix)
+/* Exact YUY2 geometries and default intervals from GC570D table 0x1400f7620. */
+static const struct gc570d_video0_format gc570d_video0_formats[] = {
+	{ 1920, 1080, 166666 },
+	{ 640, 480, 166666 },
+	{ 720, 480, 166666 },
+	{ 720, 576, 200000 },
+	{ 1024, 768, 166666 },
+	{ 1280, 720, 166666 },
+};
+
+static const struct gc570d_video0_format *
+gc570d_video0_find_format(u32 width, u32 height)
 {
-	pix->width = GC570D_WIDTH;
-	pix->height = GC570D_HEIGHT;
+	const struct gc570d_video0_format *best = &gc570d_video0_formats[0];
+	u32 best_distance = U32_MAX;
+	size_t i;
+
+	if (!width || !height)
+		return best;
+	for (i = 0; i < ARRAY_SIZE(gc570d_video0_formats); i++) {
+		const struct gc570d_video0_format *candidate =
+			&gc570d_video0_formats[i];
+		u32 distance = abs((int)width - candidate->width) +
+			abs((int)height - candidate->height);
+
+		if (distance < best_distance) {
+			best = candidate;
+			best_distance = distance;
+		}
+	}
+	return best;
+}
+
+static void gc570d_video0_fill_format(struct gc570d_dev *gc,
+				      struct v4l2_pix_format *pix,
+				      u16 width, u16 height, bool hdmi0)
+{
+	bool sd = width <= 720 && height <= 576;
+
+	pix->width = width;
+	pix->height = height;
 	pix->pixelformat = V4L2_PIX_FMT_YUYV;
-	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = GC570D_WIDTH * 2;
-	pix->sizeimage = GC570D_DMA_FRAME_SIZE;
-	pix->colorspace = V4L2_COLORSPACE_REC709;
-	pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
+	pix->field = gc570d_video_field(gc, hdmi0);
+	pix->bytesperline = width * 2;
+	pix->sizeimage = width * height * 2;
+	/*
+	 * Describe the packed YUY2 buffer produced by the capture pipeline, not
+	 * the HDMI source.  HDR is tone mapped to SDR and any source YCbCr is
+	 * converted by the receiver and Xilinx stages before the packed output,
+	 * so the established output encoding is BT.709 limited range for HD
+	 * sizes and BT.601 limited range for SD sizes.  The per-source CSC
+	 * matrices are internal and do not change the DMA buffer encoding;
+	 * publishing them here would misdescribe the captured pixels.  Keep
+	 * this established metadata until the dynamic output encoding is
+	 * physically validated.
+	 */
+	pix->colorspace = sd ? V4L2_COLORSPACE_SMPTE170M :
+			       V4L2_COLORSPACE_REC709;
+	pix->ycbcr_enc = sd ? V4L2_YCBCR_ENC_601 : V4L2_YCBCR_ENC_709;
 	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
 	pix->xfer_func = V4L2_XFER_FUNC_709;
 }
@@ -816,14 +987,23 @@ static int gc570d_video_enum_format(struct file *file, void *priv,
 static int gc570d_video_get_format(struct file *file, void *priv,
 				    struct v4l2_format *format)
 {
-	gc570d_video_fill_format(&format->fmt.pix);
+	struct gc570d_dev *gc = video_drvdata(file);
+
+	gc570d_video0_fill_format(gc, &format->fmt.pix, gc->video_width,
+				  gc->video_height, false);
 	return 0;
 }
 
 static int gc570d_video_try_format(struct file *file, void *priv,
 				    struct v4l2_format *format)
 {
-	gc570d_video_fill_format(&format->fmt.pix);
+	struct gc570d_dev *gc = video_drvdata(file);
+	const struct gc570d_video0_format *selected;
+
+	selected = gc570d_video0_find_format(format->fmt.pix.width,
+					     format->fmt.pix.height);
+	gc570d_video0_fill_format(gc, &format->fmt.pix, selected->width,
+				  selected->height, false);
 	return 0;
 }
 
@@ -831,32 +1011,53 @@ static int gc570d_video_set_format(struct file *file, void *priv,
 				    struct v4l2_format *format)
 {
 	struct gc570d_dev *gc = video_drvdata(file);
+	const struct gc570d_video0_format *selected;
+	int ret;
 
 	if (vb2_is_busy(&gc->video_queue))
 		return -EBUSY;
-	return gc570d_video_try_format(file, priv, format);
+	ret = gc570d_video_try_format(file, priv, format);
+	if (ret)
+		return ret;
+	selected = gc570d_video0_find_format(format->fmt.pix.width,
+					     format->fmt.pix.height);
+	gc->video_width = selected->width;
+	gc->video_height = selected->height;
+	gc->video_frame_interval = selected->frame_interval;
+	return 0;
 }
 
 static int gc570d_video_enum_framesizes(struct file *file, void *priv,
 					 struct v4l2_frmsizeenum *size)
 {
-	if (size->index || size->pixel_format != V4L2_PIX_FMT_YUYV)
+	if (size->index >= ARRAY_SIZE(gc570d_video0_formats) ||
+	    size->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 	size->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	size->discrete.width = GC570D_WIDTH;
-	size->discrete.height = GC570D_HEIGHT;
+	size->discrete.width = gc570d_video0_formats[size->index].width;
+	size->discrete.height = gc570d_video0_formats[size->index].height;
 	return 0;
 }
 
 static int gc570d_video_enum_frameintervals(struct file *file, void *priv,
 					     struct v4l2_frmivalenum *ival)
 {
-	if (ival->index || ival->pixel_format != V4L2_PIX_FMT_YUYV ||
-	    ival->width != GC570D_WIDTH || ival->height != GC570D_HEIGHT)
+	struct gc570d_dev *gc = video_drvdata(file);
+	const struct gc570d_video0_format *selected;
+	u16 rate;
+
+	if (ival->index || ival->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
+	selected = gc570d_video0_find_format(ival->width, ival->height);
+	if (selected->width != ival->width || selected->height != ival->height)
+		return -EINVAL;
+	if (READ_ONCE(gc->video_no_signal))
+		rate = gc570d_video_interval_rate(selected->frame_interval);
+	else
+		rate = gc570d_video_source_rate(gc, false);
 	ival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
 	ival->discrete.numerator = 1;
-	ival->discrete.denominator = 60;
+	ival->discrete.denominator = rate;
 	return 0;
 }
 
@@ -890,6 +1091,7 @@ static int gc570d_video_set_input(struct file *file, void *priv,
 static int gc570d_video_get_parm(struct file *file, void *priv,
 				  struct v4l2_streamparm *parm)
 {
+	struct gc570d_dev *gc = video_drvdata(file);
 	struct v4l2_captureparm *capture = &parm->parm.capture;
 
 	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
@@ -898,7 +1100,8 @@ static int gc570d_video_get_parm(struct file *file, void *priv,
 	memset(capture, 0, sizeof(*capture));
 	capture->capability = V4L2_CAP_TIMEPERFRAME;
 	capture->timeperframe.numerator = 1;
-	capture->timeperframe.denominator = 60;
+	capture->timeperframe.denominator =
+		gc570d_video_source_rate(gc, false);
 	capture->readbuffers = 4;
 	return 0;
 }
@@ -1003,7 +1206,8 @@ static bool gc570d_video0_work_pending(struct gc570d_dev *gc)
 	       READ_ONCE(gc->video0_event_head) !=
 		READ_ONCE(gc->video0_event_tail) ||
 	       (!READ_ONCE(gc->video0_no_signal) &&
-		!READ_ONCE(gc->video0_receiver_output_valid)) ||
+		(!READ_ONCE(gc->video0_receiver_output_valid) ||
+		 READ_ONCE(gc->video0_reconfigure_pending))) ||
 	       (READ_ONCE(gc->video0_no_signal) &&
 		!list_empty_careful(&gc->video0_buffers));
 }
@@ -1180,7 +1384,8 @@ static int gc570d_video0_thread(void *data)
 		if (kthread_should_stop() || READ_ONCE(gc->video0_stopping))
 			break;
 		if (!READ_ONCE(gc->video0_no_signal) &&
-		    !READ_ONCE(gc->video0_receiver_output_valid)) {
+		    (!READ_ONCE(gc->video0_receiver_output_valid) ||
+		     READ_ONCE(gc->video0_reconfigure_pending))) {
 			ret = gc570d_video0_switch_to_no_signal(gc);
 			dma_idle_polls = 0;
 			stable_polls = 0;
@@ -1321,7 +1526,7 @@ static int gc570d_video0_thread(void *data)
 			}
 			memcpy(destination, gc->video0_dma_cpu[slot], frame_size);
 			buffer->vb.sequence = gc->video0_sequence++;
-			buffer->vb.field = V4L2_FIELD_NONE;
+			buffer->vb.field = gc570d_video_field(gc, true);
 			buffer->vb.vb2_buf.timestamp = ktime_get_ns();
 			vb2_set_plane_payload(&buffer->vb.vb2_buf, 0, frame_size);
 			vb2_buffer_done(&buffer->vb.vb2_buf,
@@ -1451,6 +1656,7 @@ static int gc570d_video0_switch_to_no_signal(struct gc570d_dev *gc)
 	gc->video0_no_signal_frame = frame;
 	gc->video0_dma_active = false;
 	gc->video0_receiver_output_valid = false;
+	WRITE_ONCE(gc->video0_reconfigure_pending, false);
 	WRITE_ONCE(gc->video0_no_signal, true);
 	if (!gc->video_dma_active && !gc->audio_prepared &&
 	    !gc->audio0_prepared)
@@ -1478,7 +1684,8 @@ static int gc570d_video0_try_recover_live(struct gc570d_dev *gc,
 	if (!mutex_trylock(&gc->capture_lock))
 		return 0;
 	if (READ_ONCE(gc->suspended) || gc->video0_stopping ||
-	    !gc->video0_streaming || !gc->video0_no_signal) {
+	    !gc->video0_streaming || !gc->video0_no_signal ||
+	    (auto_hdmi1 && !READ_ONCE(gc->hdmi1_auto_ready))) {
 		mutex_unlock(&gc->capture_lock);
 		return 0;
 	}
@@ -1570,6 +1777,7 @@ static int gc570d_video0_try_recover_live(struct gc570d_dev *gc,
 
 	placeholder = gc->video0_no_signal_frame;
 	gc->video0_no_signal_frame = NULL;
+	WRITE_ONCE(gc->video0_reconfigure_pending, false);
 	WRITE_ONCE(gc->video0_no_signal, false);
 	mutex_unlock(&gc->capture_lock);
 	kvfree(placeholder);
@@ -1740,6 +1948,8 @@ static int gc570d_video0_start_streaming(struct vb2_queue *queue,
 	 * configuration when the HDMI format changes.  The Linux passthrough pump owns only the
 	 * splitter, so refresh the HDMI IN 1 receiver here before every RUN.
 	 */
+	if (auto_hdmi1 && !READ_ONCE(gc->hdmi1_auto_ready))
+		goto out_no_signal;
 	ret = gc570d_it68051_video_output_on(gc);
 	if (ret && gc570d_video_is_no_signal_error(ret))
 		goto out_no_signal;
@@ -1790,6 +2000,7 @@ static int gc570d_video0_start_streaming(struct vb2_queue *queue,
 	gc->video0_stopping = false;
 	gc->video0_streaming = true;
 	gc->video0_no_signal = false;
+	WRITE_ONCE(gc->video0_reconfigure_pending, false);
 	gc->video0_dma_active = false;
 	gc->video0_irq_active = false;
 	WRITE_ONCE(gc->dma0_continuous, true);
@@ -1934,6 +2145,9 @@ static void gc570d_video0_stop_streaming(struct vb2_queue *queue)
 	WRITE_ONCE(gc->video0_stopping, false);
 	WRITE_ONCE(gc->video0_no_signal, false);
 	WRITE_ONCE(gc->video0_dma_active, false);
+	WRITE_ONCE(gc->video0_reconfigure_pending, false);
+	gc->video0_input_frame_rate = 0;
+	gc->video0_input_interlaced = false;
 	if (gc->video0_irq_active) {
 		gc570d_video_irq_put_locked(gc);
 		gc->video0_irq_active = false;
@@ -1957,73 +2171,26 @@ static const struct vb2_ops gc570d_video0_queue_ops = {
 	.stop_streaming = gc570d_video0_stop_streaming,
 };
 
-/* Exact YUY2 geometries and default intervals from GC570D table 0x1400f7620. */
-static const struct gc570d_video0_format gc570d_video0_formats[] = {
-	{ 1920, 1080, 166666 },
-	{ 640, 480, 166666 },
-	{ 720, 480, 166666 },
-	{ 720, 576, 200000 },
-	{ 1024, 768, 166666 },
-	{ 1280, 720, 166666 },
-};
-
-static const struct gc570d_video0_format *
-gc570d_video0_find_format(u32 width, u32 height)
-{
-	const struct gc570d_video0_format *best = &gc570d_video0_formats[0];
-	u32 best_distance = U32_MAX;
-	size_t i;
-
-	if (!width || !height)
-		return best;
-	for (i = 0; i < ARRAY_SIZE(gc570d_video0_formats); i++) {
-		const struct gc570d_video0_format *candidate =
-			&gc570d_video0_formats[i];
-		u32 distance = abs((int)width - candidate->width) +
-			abs((int)height - candidate->height);
-
-		if (distance < best_distance) {
-			best = candidate;
-			best_distance = distance;
-		}
-	}
-	return best;
-}
-
-static void gc570d_video0_fill_format(struct v4l2_pix_format *pix,
-				       u16 width, u16 height)
-{
-	pix->width = width;
-	pix->height = height;
-	pix->pixelformat = V4L2_PIX_FMT_YUYV;
-	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = width * 2;
-	pix->sizeimage = width * height * 2;
-	pix->colorspace = V4L2_COLORSPACE_REC709;
-	pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
-	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
-	pix->xfer_func = V4L2_XFER_FUNC_709;
-}
-
 static int gc570d_video0_get_format(struct file *file, void *priv,
 				     struct v4l2_format *format)
 {
 	struct gc570d_dev *gc = video_drvdata(file);
 
-	gc570d_video0_fill_format(&format->fmt.pix, gc->video0_width,
-				  gc->video0_height);
+	gc570d_video0_fill_format(gc, &format->fmt.pix, gc->video0_width,
+				  gc->video0_height, true);
 	return 0;
 }
 
 static int gc570d_video0_try_format(struct file *file, void *priv,
 				     struct v4l2_format *format)
 {
+	struct gc570d_dev *gc = video_drvdata(file);
 	const struct gc570d_video0_format *selected;
 
 	selected = gc570d_video0_find_format(format->fmt.pix.width,
 					     format->fmt.pix.height);
-	gc570d_video0_fill_format(&format->fmt.pix, selected->width,
-				  selected->height);
+	gc570d_video0_fill_format(gc, &format->fmt.pix, selected->width,
+				  selected->height, true);
 	return 0;
 }
 
@@ -2075,17 +2242,22 @@ static int gc570d_video0_enum_framesizes(struct file *file, void *priv,
 static int gc570d_video0_enum_frameintervals(
 	struct file *file, void *priv, struct v4l2_frmivalenum *ival)
 {
+	struct gc570d_dev *gc = video_drvdata(file);
 	const struct gc570d_video0_format *selected;
+	u16 rate;
 
 	if (ival->index || ival->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 	selected = gc570d_video0_find_format(ival->width, ival->height);
 	if (selected->width != ival->width || selected->height != ival->height)
 		return -EINVAL;
+	if (READ_ONCE(gc->video0_no_signal))
+		rate = gc570d_video_interval_rate(selected->frame_interval);
+	else
+		rate = gc570d_video_source_rate(gc, true);
 	ival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
 	ival->discrete.numerator = 1;
-	ival->discrete.denominator = selected->frame_interval == 200000 ?
-		50 : 60;
+	ival->discrete.denominator = rate;
 	return 0;
 }
 
@@ -2101,7 +2273,7 @@ static int gc570d_video0_get_parm(struct file *file, void *priv,
 	capture->capability = V4L2_CAP_TIMEPERFRAME;
 	capture->timeperframe.numerator = 1;
 	capture->timeperframe.denominator =
-		gc->video0_frame_interval == 200000 ? 50 : 60;
+		gc570d_video_source_rate(gc, true);
 	capture->readbuffers = GC570D_DMA_BURST_FRAMES;
 	return 0;
 }

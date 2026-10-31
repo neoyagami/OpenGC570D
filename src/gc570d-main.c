@@ -569,6 +569,9 @@ static int gc570d_probe(struct pci_dev *pdev,
 	atomic_set(&gc->control_irq_seen, 0);
 	atomic_set(&gc->audio_irq_pending, 0);
 	atomic_set(&gc->audio0_irq_pending, 0);
+	gc->video_width = 1920;
+	gc->video_height = 1080;
+	gc->video_frame_interval = 166666;
 	gc->video0_width = 1920;
 	gc->video0_height = 1080;
 	gc->video0_frame_interval = 166666;
