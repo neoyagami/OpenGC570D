@@ -53,7 +53,7 @@ Validated on the project hardware:
 | --- | --- |
 | HDMI IN 1 passthrough | 3840x2160p60 SDR and HDR; 2560x1440p60 SDR and HDR; 2560x1440p120 HDR |
 | HDMI IN 1 high-resolution capture | 2160p60 SDR/HDR, 1440p60 SDR/HDR and measured 1440p120 HDR input converted to 1920x1080 YUYV SDR at 60 fps |
-| HDMI IN 1 native and hardware-scaled capture | 1080p, 1080i, 1024x768, 1280x720p60 SDR and 720x480p59.94/60 (or 640x480p60) SDR inputs captured at their native YUYV geometry; 1280x720p60 SDR is also physically validated hardware-scaled by VIP0 to 1920x1080p60 SDR. `1080i` is reported as `V4L2_FIELD_INTERLACED`, and 720x480 is displayed at its intended 4:3 aspect ratio |
+| HDMI IN 1 native and hardware-scaled capture | 1080p60 and 1080i60 SDR/HDR, plus 1024x768, 1280x720p60 SDR and 720x480p59.94/60 (or 640x480p60) SDR inputs captured at their native YUYV geometry; 1280x720p60 SDR/HDR is also physically validated hardware-scaled by VIP0 to 1920x1080p60 SDR. HDR inputs are tone mapped to SDR, `1080i` is reported as `V4L2_FIELD_INTERLACED`, and 720x480 is displayed at its intended 4:3 aspect ratio |
 | HDMI IN 2 capture | Discrete YUYV sizes from 640x480 to 1920x1080, captured natively from 1080p/1080i/720p/480p/1024x768 sources or hardware-scaled to the active V4L2 geometry through the VIP1 hardware scaler; cadence follows the source instead of the output size, so 50 Hz sources report 50 fps and 60 Hz sources report 60 fps |
 | HDMI IN 1 audio | `HDMI 1 (Passthrough)`, ALSA capture device 1, stereo S16_LE at 48 kHz, including front left/right capture during 5.1 LPCM passthrough to HDMI OUT; the vendor bridge EDID also advertises 7.1 LPCM, which is not yet physically validated; direct ALSA and PipeWire validated, including automatic recovery on the same open audio stream across disconnect/reconnect and stereo/surround transitions |
 | HDMI IN 2 audio | `HDMI 2 (Capture Only)`, ALSA capture device 0, stereo S16_LE at 48 kHz; direct ALSA and PipeWire validated |
@@ -66,9 +66,10 @@ The 720x480 mode stores a 3:2 raster but represents 4:3 video through its
 non-square pixel aspect ratio. `VIDIOC_G_FMT` describes the configured capture
 buffers, not the detected input geometry: use `VIDIOC_S_FMT` with the source
 resolution to capture a sub-1080p HDMI IN 1 signal natively. Selecting
-1920x1080 for a 1280x720p60 HDMI IN 1 source uses the VIP0 hardware scaler and
-has also been physically validated. The driver does not report input geometry
-through `VIDIOC_G_FMT`.
+1920x1080 for a 1280x720p60 SDR or HDR HDMI IN 1 source uses the VIP0 hardware
+scaler and has also been physically validated. HDR input is tone mapped to the
+SDR capture output. The driver does not report input geometry through
+`VIDIOC_G_FMT`.
 `VIDIOC_G_PARM` and `VIDIOC_ENUM_FRAMEINTERVALS` report the source cadence for
 the active input, independent of the chosen capture size; spatial VIP0/VIP1
 scaling does not convert frame rate. HDMI IN 1 normalizes measured receiver
