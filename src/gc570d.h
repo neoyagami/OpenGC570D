@@ -147,6 +147,7 @@ extern bool auto_hdmi1;
 #define GC570D_AUDIO_CHANNELS     2
 #define GC570D_AUDIO_PERIOD_FRAMES 480
 #define GC570D_AUDIO_PCM_BUFFER_MAX (GC570D_AUDIO_PERIOD_BYTES * 64)
+#define GC570D_AUDIO_WAIT_TIME_MS 500
 
 /* The official driver audio channel 0 is paired with HDMI IN 1 / DMA0. */
 #define GC570D_AUDIO0_CHANNEL       0

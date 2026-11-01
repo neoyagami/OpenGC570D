@@ -654,6 +654,8 @@ static int gc570d_audio_pcm_open(struct snd_pcm_substream *substream)
 	int ret;
 
 	substream->runtime->hw = gc570d_audio_pcm_hardware;
+	/* Allow a transient DMA pause without failing a blocking reader. */
+	substream->wait_time = GC570D_AUDIO_WAIT_TIME_MS;
 	ret = snd_pcm_hw_constraint_integer(substream->runtime,
 					    SNDRV_PCM_HW_PARAM_PERIODS);
 	return ret;
@@ -1011,6 +1013,12 @@ static int gc570d_audio0_pcm_thread(void *data)
 		if (kthread_should_stop())
 			break;
 		if (READ_ONCE(gc->audio0_recovering)) {
+			/* Keep ALSA moving before synchronous receiver recovery. */
+			memset(period, 0, sizeof(period));
+			ret = gc570d_audio0_pcm_push_period(gc, period);
+			if (ret)
+				goto xrun;
+
 			if ((!READ_ONCE(gc->video0_streaming) ||
 			     (!READ_ONCE(gc->video0_no_signal) &&
 			      READ_ONCE(gc->video0_receiver_output_valid))) &&
@@ -1022,10 +1030,6 @@ static int gc570d_audio0_pcm_thread(void *data)
 					continue;
 				next_recovery = jiffies + msecs_to_jiffies(250);
 			}
-			memset(period, 0, sizeof(period));
-			ret = gc570d_audio0_pcm_push_period(gc, period);
-			if (ret)
-				goto xrun;
 			usleep_range(9500, 10500);
 			continue;
 		}
@@ -1095,6 +1099,8 @@ static int gc570d_audio0_pcm_open(struct snd_pcm_substream *substream)
 	int ret;
 
 	substream->runtime->hw = gc570d_audio_pcm_hardware;
+	/* Receiver reconfiguration may take longer than ALSA's minimum wait. */
+	substream->wait_time = GC570D_AUDIO_WAIT_TIME_MS;
 	ret = snd_pcm_hw_constraint_integer(substream->runtime,
 					    SNDRV_PCM_HW_PARAM_PERIODS);
 	return ret;
@@ -1384,9 +1390,10 @@ int gc570d_audio_register(struct gc570d_dev *gc)
 	strscpy(pcm->name, "HDMI 2 (Capture Only)", sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE,
 			&gc570d_audio_pcm_ops);
+	/* ALSA clamps buffer_bytes_max to each managed preallocation size. */
 	ret = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC,
 					     NULL,
-					     2 * GC570D_AUDIO_PERIOD_BYTES,
+					     GC570D_AUDIO_PCM_BUFFER_MAX,
 					     GC570D_AUDIO_PCM_BUFFER_MAX);
 	if (ret)
 		return ret;
@@ -1400,7 +1407,7 @@ int gc570d_audio_register(struct gc570d_dev *gc)
 			&gc570d_audio0_pcm_ops);
 	ret = snd_pcm_set_managed_buffer_all(pcm0, SNDRV_DMA_TYPE_VMALLOC,
 					     NULL,
-					     2 * GC570D_AUDIO_PERIOD_BYTES,
+					     GC570D_AUDIO_PCM_BUFFER_MAX,
 					     GC570D_AUDIO_PCM_BUFFER_MAX);
 	if (ret)
 		return ret;
