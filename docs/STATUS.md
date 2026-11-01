@@ -18,6 +18,7 @@ see [`CONTRIBUTING.md`](../CONTRIBUTING.md) for the requested report details.
 | HDMI IN 1 1440p60 SDR/HDR to 1080p60 SDR capture | Physically validated |
 | HDMI IN 1 measured 1440p120 HDR to 1080p60 SDR capture | Physically validated |
 | HDMI IN 1 native 1080i, 1024x768, 720p60, and 480p60 SDR capture | Physically validated at native V4L2 capture geometry (`1920x1080` for 1080i using the recovered hardware field handling and `V4L2_FIELD_INTERLACED`, `1024x768`, `1280x720`, and `720x480`/`640x480`) |
+| HDMI IN 1 720p60 SDR to 1080p60 SDR VIP0 hardware scaling | Physically validated at `1920x1080` YUYV/60: full progressive geometry removes duplicated fields and preserves 59.94 fps DMA cadence |
 | HDMI IN 2 1080i, 720p, 480p, and 1024x768 capture and VIP1 hardware scaling | Physically validated both at native geometry and hardware-scaled to `1920x1080`, including automatic VIP1 reinitialization across live source resolution changes; 1080i is reconstructed as progressive `V4L2_FIELD_NONE` |
 | HDMI IN 1 and HDMI IN 2 576p50 capture | Implemented in the format tables and VIP0/VIP1 scaler paths; 576p50 remains unvalidated until a physical 50 Hz source is tested |
 | HDMI IN 1 stereo S16_LE/48 kHz ALSA | Physically validated |

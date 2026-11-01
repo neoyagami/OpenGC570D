@@ -715,9 +715,22 @@ int gc570d_vip0_program_yuy2(
 	u32 scaler_out_height = output_field_height;
 	u32 scaler_flags = output_width * 2 < input_width ? BIT(0) : 0;
 	bool scale = input_width != output_width || input_height != output_height;
+	/*
+	 * VIP0 consumes a progressive upscale as complete frames.  Applying the
+	 * software-interlace half-height encoding to this case makes the hardware
+	 * deliver duplicated fields at half cadence.  Native, downscale, and true
+	 * interlaced paths retain the recovered field encoding below.
+	 */
+	bool progressive_upscale = !signal->interlaced &&
+		input_height < output_height;
 	u32 clock_interval;
 	u32 value;
 	int ret;
+
+	if (progressive_upscale) {
+		scaler_in_height = input_height;
+		scaler_out_height = output_height;
+	}
 
 	/* The official driver preserves every existing 0x1040 bit and sets bit 2. */
 	value = readl(gc->bar0 + GC570D_VIP_GLOBAL_ENABLE);
@@ -753,7 +766,8 @@ int gc570d_vip0_program_yuy2(
 	writel(0, gc->bar0 + GC570D_VIP0_WINDOW_WIDTH);
 	writel(input_width, gc->bar0 + GC570D_VIP0_OUTPUT_WIDTH);
 	writel(0, gc->bar0 + GC570D_VIP0_WINDOW_HEIGHT);
-	writel(((input_height & ~1) << 15) | input_field_height,
+	writel(progressive_upscale ? input_height :
+	       ((input_height & ~1) << 15) | input_field_height,
 	       gc->bar0 + GC570D_VIP0_OUTPUT_HEIGHT);
 
 	/*

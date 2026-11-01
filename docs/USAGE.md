@@ -44,9 +44,11 @@ range and SD sizes report BT.601 limited range.
   `1920x1080` in the `Xilinx` preprocessing stage and captures `1080p`, `1080i`,
   `1024x768`, `720p`, `576p`, and `480p` inputs at their native hardware
   geometry without software scaling. `1080i` uses the recovered hardware field
-  handling and is reported with `V4L2_FIELD_INTERLACED`. When capturing
-  sub-1080p signals on HDMI IN 1 in applications such as OBS, select the matching
-  source resolution in the V4L2 capture properties.
+  handling and is reported with `V4L2_FIELD_INTERLACED`. VIP0 can also scale a
+  progressive source to the negotiated V4L2 geometry; `1280x720p60` to
+  `1920x1080p60` is physically validated. Select the matching source resolution
+  for native capture or `1920x1080` for the validated 720p hardware-upscale
+  path.
 * **HDMI IN 2 (`gc570d-hdmi2`)**: Supports `1080p`, `1080i`, `1024x768`, `720p`,
   `576p`, and `480p` inputs either at their native resolution or hardware-scaled
   to the negotiated V4L2 resolution (such as `1920x1080`) through the `VIP1`
