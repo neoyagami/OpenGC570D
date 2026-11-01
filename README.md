@@ -72,6 +72,94 @@ matrix, including 720x576, every source/monitor combination, VRR, and all
 advertised refresh rates. HDCP-protected content is unsupported. Capture
 output is SDR, capped at 60 fps, and no larger than 1920x1080.
 
+## Driver roadmap
+
+The next development stages focus on GC570D-specific hardware-control gaps
+between the recovered Windows behavior and the Linux driver. They do not aim
+to reproduce Windows APIs or move frame processing into userspace.
+
+### 1. HDMI OUT capability adaptation
+
+- Recover the complete per-display output decision instead of always using
+  original/bypass mode.
+- Use the splitter hardware for colour-space conversion, chroma conversion
+  and supported downscaling when the source and HDMI OUT display differ.
+- Reproduce the Windows deep-colour decisions, including conversion from
+  10/12-bit input to 8-bit output when required by the display.
+- Suppress HDR packets when the connected display does not advertise a
+  compatible EOTF, and handle HDMI and DVI sinks separately.
+- Keep this path hardware-only; CPU or userspace frame scaling is outside the
+  project design.
+
+### 2. EDID and negotiation policies
+
+- Preserve the existing `preserve` and `renegotiate` policies and their
+  documented capture-continuity trade-off.
+- Recover and validate the remaining Windows splitter work modes: composed
+  capabilities, default 4K, default 2K and local mode.
+- Make the selected negotiation policy an explicit startup configuration,
+  with deliberate HPD pulses only for policies that permit source
+  renegotiation.
+- Expand testing across multi-block EDIDs, DVI displays and source/monitor
+  combinations whose supported modes do not match.
+
+### 3. Post-link monitoring and recovery
+
+- Port the remaining bounded SCDC channel-error monitoring and long-term
+  signal/SCDT watchdog behavior.
+- Add the corresponding staged recovery actions: retry, transmitter reset,
+  HPD renegotiation and board-path reset only when earlier recovery levels
+  fail.
+- Preserve active capture whenever the selected policy permits it and avoid
+  broad resets that disturb the other HDMI input.
+
+### 4. HDMI packet and HDR policy
+
+- Track the DRM HDR, AVI and relevant vendor-specific InfoFrames rather than
+  relying only on the current AVI BT.2020 heuristic.
+- Distinguish HDR10, HLG and BT.2020 SDR before selecting receiver CSC and
+  Xilinx HDR-to-SDR processing.
+- Add a controlled HDR-to-SDR maximum-luminance setting while retaining the
+  recovered 3000-nit curve as the default.
+- Validate mid-stream HDR/SDR and colour-depth transitions without requiring
+  a physical reconnect.
+
+### 5. HDMI audio transport validation
+
+- Complete physical validation of 7.1-channel 48 kHz LPCM passthrough.
+- Determine, independently of the ALSA capture interface, which compressed,
+  HBR and DSD audio packets the splitter can forward transparently.
+- Extend receiver control only where the official GC570D path and hardware
+  tests demonstrate a supported behavior.
+
+### 6. Enclosure lighting parity
+
+- Add selected recovered Windows lighting modes and frequency controls when
+  they can be represented without weakening the standard multicolor LED
+  interface.
+- Consider persistent driver-load lighting configuration; application-open
+  behavior remains optional because Linux applications do not share the
+  Windows private control protocol.
+
+### Project boundaries
+
+- Firmware flashing and FPGA update tooling remain Windows/vendor-specific
+  maintenance operations and are not planned for this Linux driver.
+- HDCP authentication and protected-content capture remain unsupported and
+  are not a project goal.
+- ALSA and V4L2 API expansion is outside this Windows-hardware-parity roadmap;
+  fixes required for the already supported interfaces remain in scope.
+- VRR, ALLM, CEC and other optional HDMI features will not be claimed or
+  implemented until the GC570D Windows path and physical hardware support are
+  demonstrated.
+- The validated shared INTx transport remains the default. MSI will only be
+  reconsidered if the card's zero-status interrupt storm can be explained and
+  eliminated without reducing reliability.
+
+Each stage is developed through `dev`, reviewed against recovered behavior,
+and physically tested on the card before promotion to `main`. Hardware changes
+continue to use small, reversible, one-test-at-a-time iterations.
+
 ## Verified configurations
 
 Independent reproductions of the driver on other distributions:
