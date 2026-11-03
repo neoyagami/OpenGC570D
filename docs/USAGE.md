@@ -136,18 +136,35 @@ EDID, which already advertises 8-channel LPCM and the 5.1/7.1 speaker layout.
 The receiver accepts 2-channel stereo as well as multichannel (5.1/7.1, up to
 8-channel) 48000 Hz uncompressed LPCM for passthrough to HDMI OUT while routing
 the front left/right stereo pair (`SD0`) to the `HDMI 1 (Passthrough)` ALSA
-capture device (`S16_LE`, 48000 Hz, 2 channels). Only 5.1 passthrough with
-simultaneous stereo capture has been physically validated; 7.1 passthrough and
-isolated audio cold start remain unvalidated. Although the bridge EDID
-advertises the baseline CTA-861 LPCM sample rates (32/44.1/48 kHz) and no
-compressed audio formats, the FPGA capture path and ALSA constraints operate
-strictly at 48000 Hz LPCM; 32 kHz and 44.1 kHz LPCM sources (or forced non-LPCM
-bitstreams) are rejected by the capture path with a ratelimited kernel warning.
+capture device (`S16_LE`, 48000 Hz, 2 channels). Stereo and 5.1 cold starts were
+physically validated with ALSA both closed and open. The 5.1 speaker test
+confirmed FL, FC, FR, SR, SL and LFE in their correct HDMI OUT positions while
+ALSA captured only FL/FR as designed. The 5.1 passthrough did not collapse to
+stereo when ALSA capture was active. 7.1 passthrough remains implemented but
+physically unvalidated.
+
+Both PCM devices expose a 120 KiB managed allocation by default, allowing from
+2 to 64 periods and from 960 to 30720 frames. A normal `arecord` invocation in
+the validation environment negotiated 50 periods, 24000 frames and a 500 ms
+buffer without a manual `/proc/asound` preallocation change or command-line
+buffer override. This describes the tested client negotiation, not a fixed
+latency imposed on every ALSA client.
+
 During link loss or dynamic stereo/surround format transitions, the PCM stream
 remains alive and supplies silence while the receiver relocks, then
 automatically restarts HDMI IN 1 audio DMA so live audio returns without closing
-the audio client or reselecting the source. This recovery was physically
-validated while HDMI IN 2 continued operating.
+the audio client or reselecting the source. On CachyOS `7.3.1-1-cachyos`, one
+35-second recording with active V4L2 survived 2.0 -> 5.1 -> 2.0 with no `-EIO`,
+`thread_error=0`, and measured recovery times of 138.6 ms and 120.8 ms. A 5.1
+physical disconnect/reconnect also returned video and audio on the same open
+descriptors. HDMI IN 2 passed a simultaneous V4L2 and stereo-audio smoke test
+with the same default managed-buffer behavior.
+
+Although the bridge EDID advertises the baseline CTA-861 LPCM sample rates
+(32/44.1/48 kHz) and no compressed audio formats, the FPGA capture path and
+ALSA constraints operate strictly at 48000 Hz LPCM; 32 kHz and 44.1 kHz LPCM
+sources (or forced non-LPCM bitstreams) are rejected by the capture path with a
+ratelimited kernel warning.
 
 Under the default `preserve` policy (`hdmi1_hotplug_policy=preserve`), connecting
 or disconnecting an HDMI OUT monitor never pulses upstream HPD or interrupts

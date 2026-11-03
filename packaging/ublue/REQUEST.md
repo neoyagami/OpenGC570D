@@ -5,7 +5,7 @@
 This is a review draft, not a claim that Universal Blue or Easy Anti-Cheat has
 approved OpenGC570D.
 
-This draft targets the `v1.0.5` source tag. Submit it only after that release
+This draft targets the `v1.0.6` source tag. Submit it only after that release
 has been published and the final tag has passed the RPM/AKMOD validation.
 
 ## Package request: ublue-os/packages
@@ -26,7 +26,7 @@ pipeline rather than a locally installed unsigned module.
 Upstream source and release:
 
 - <https://github.com/neoyagami/OpenGC570D>
-- <https://github.com/neoyagami/OpenGC570D/releases/tag/v1.0.5>
+- <https://github.com/neoyagami/OpenGC570D/releases/tag/v1.0.6>
 
 The repository includes source/provenance, reverse-engineering, security,
 maintainer and packaging documentation. It contains no vendor driver or
@@ -37,12 +37,12 @@ firmware and does not require firmware at runtime.
 - License: `GPL-2.0-only`; the module reports `MODULE_LICENSE("GPL v2")`.
 - Architectures: `x86_64` only until another architecture is physically
   validated.
-- Common RPM: `gc570d-1.0.5-1.fc44.noarch`.
-- AKMOD RPM: `akmod-gc570d-1.0.5-1.fc44.x86_64`.
+- Common RPM: `gc570d-1.0.6-1.fc44.noarch`.
+- AKMOD RPM: `akmod-gc570d-1.0.6-1.fc44.x86_64`.
 - PCI alias: `pci:v00001461d00000054sv00001461sd00005700bc*sc*i*`.
 - Fedora 44 release gate: GitHub Actions builds both RPMs and SRPMs, runs
   `rpmlint`, rebuilds the module through AKMOD and confirms that the
-  development `debugfs` interface is disabled. Publish `v1.0.5` only after
+  development `debugfs` interface is disabled. Publish `v1.0.6` only after
   both jobs pass for the final tag.
 - Native driver validation: Bazzite 44 with OGC kernel
   `7.2.9-ogc3.1.fc44.x86_64`; detailed hardware results are in
