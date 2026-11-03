@@ -77,7 +77,8 @@ jobs:
             spectool -g -C "$rpm_topdir/SOURCES" \
               "$rpm_topdir/SPECS/gc570d-kmod.spec"
           else
-            git archive --format=tar.gz --prefix="OpenGC570D-$version/" \
+            git -c safe.directory="$PWD" archive --format=tar.gz \
+              --prefix="OpenGC570D-$version/" \
               --output="$rpm_topdir/SOURCES/OpenGC570D-$version.tar.gz" HEAD
           fi
           rpmbuild --define "_topdir $rpm_topdir" -ba \
