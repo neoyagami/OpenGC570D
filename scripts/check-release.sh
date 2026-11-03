@@ -71,6 +71,7 @@ for required in \
 	src/gc570d-video.c \
 	config/systemd/gc570d.service \
 	config/wireplumber/51-gc570d.conf \
+	config/gc570d.conf \
 	assets/README.md \
 	assets/no-signal.png \
 	data/gc570d_hdr_lut_3000.inc \
@@ -97,6 +98,7 @@ for licensed in "$PROJECT_DIR/Makefile" \
 	"$PROJECT_DIR"/packaging/fedora/*.rpmlintrc \
 	"$PROJECT_DIR"/packaging/ublue/*.sh \
 	"$PROJECT_DIR"/scripts/*.sh \
+	"$PROJECT_DIR"/config/*.conf \
 	"$PROJECT_DIR"/config/systemd/*.service \
 	"$PROJECT_DIR"/config/wireplumber/*.conf
 do

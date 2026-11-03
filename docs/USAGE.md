@@ -26,10 +26,39 @@ done
 
 Expected names are `gc570d-hdmi2` and `gc570d-hdmi1`.
 
-HDMI IN 2 publishes fixed 1920x1080 YUYV at 60 fps. HDMI IN 1 publishes the
-recovered discrete YUYV capture sizes. High-resolution sources use
-1920x1080p60 SDR output; native 1280x720p60 can use 1280x720 output.
+Both V4L2 nodes publish the recovered discrete YUYV capture sizes (`1920x1080`,
+`1280x720`, `1024x768`, `720x576`, `720x480`, and `640x480`). The capture rate
+follows the source, so the same size can run at 50 or 60 Hz; do not infer a
+frame rate from the output geometry. `VIDIOC_G_PARM` and
+`VIDIOC_ENUM_FRAMEINTERVALS` report the source cadence for every advertised
+size. HDMI IN 1 normalizes measured receiver timing to the 24/25/30/50/60 Hz
+families with a ±3 Hz tolerance and caps higher-rate inputs at 60 fps. HDMI IN 2
+decodes the CEA AVI VIC for standard video modes. VIP0/VIP1 perform spatial
+scaling only; they do not convert frame rate. The colorspace, YCbCr encoding,
+quantization, and transfer function reported by `VIDIOC_G_FMT`/`VIDIOC_TRY_FMT`
+describe the packed DMA buffer, not the HDMI source: HDR is tone mapped to SDR
+and source YCbCr is converted before capture, so HD sizes report BT.709 limited
+range and SD sizes report BT.601 limited range.
 
+* **HDMI IN 1 (`gc570d-hdmi1`)**: Downscales `2160p` and `1440p` inputs to
+  `1920x1080` in the `Xilinx` preprocessing stage and captures `1080p`, `1080i`,
+  `1024x768`, `720p`, `576p`, and `480p` inputs at their native hardware
+  geometry without software scaling. `1080i` uses the recovered hardware field
+  handling and is reported with `V4L2_FIELD_INTERLACED`. VIP0 can also scale a
+  progressive source to the negotiated V4L2 geometry; `1280x720p60` to
+  `1920x1080p60` is physically validated with both SDR and HDR BT.2020 input.
+  HDR input is tone mapped to SDR in the same hardware path. Select the matching
+  source resolution for native capture or `1920x1080` for the validated 720p
+  hardware-upscale path. Native-geometry `1080p60` and `1080i60` HDR-to-SDR
+  capture are also physically validated.
+* **HDMI IN 2 (`gc570d-hdmi2`)**: Supports `1080p`, `1080i`, `1024x768`, `720p`,
+  `576p`, and `480p` inputs either at their native resolution or hardware-scaled
+  to the negotiated V4L2 resolution (such as `1920x1080`) through the `VIP1`
+  hardware scaler. `VIP1` reconstructs progressive frames, so `1080i` and the
+  scaled outputs are reported as `V4L2_FIELD_NONE`.
+
+`576p50` is implemented but remains unvalidated until a physical 50 Hz source
+is tested.
 Example query:
 
 ```sh
@@ -37,9 +66,10 @@ v4l2-ctl -d /dev/video1 --list-formats-ext
 v4l2-ctl -d /dev/video2 --list-formats-ext
 ```
 
-For simultaneous capture, start HDMI IN 2 first, wait for it to stream, and
-then start HDMI IN 1. Reverse order is intentionally rejected because it has
-not yet been safely validated.
+For simultaneous capture, the two nodes may be started in either order. The
+physically validated sequence is HDMI IN 2 first, wait for it to stream, then
+HDMI IN 1; starting HDMI IN 1 first is supported by preserving the shared VIP
+registers while the other channel is active.
 
 ## Video4Linux2 capture
 
@@ -100,11 +130,49 @@ physically validated for HDMI IN 1 and HDMI IN 2 without STREAMOFF, closing
 the capture client, or selecting the device again. The HDMI IN 1 cycle was also
 validated while HDMI IN 2 remained open and live: its passthrough and capture
 recovered after HDMI renegotiation while the original V4L2 stream stayed open.
-HDMI IN 1 audio follows the same open-stream lifecycle. During link loss its
-PCM remains alive and supplies silence; after video becomes stable the driver
-restarts only HDMI IN 1 audio DMA and real stereo audio returns without closing
-the audio client or selecting the source again. This video-and-audio recovery
-was physically validated while HDMI IN 2 continued operating.
+HDMI IN 1 audio follows the same open-stream lifecycle. The driver does not add
+or rewrite multichannel EDID data: normal passthrough uses the vendor bridge
+EDID, which already advertises 8-channel LPCM and the 5.1/7.1 speaker layout.
+The receiver accepts 2-channel stereo as well as multichannel (5.1/7.1, up to
+8-channel) 48000 Hz uncompressed LPCM for passthrough to HDMI OUT while routing
+the front left/right stereo pair (`SD0`) to the `HDMI 1 (Passthrough)` ALSA
+capture device (`S16_LE`, 48000 Hz, 2 channels). Stereo and 5.1 cold starts were
+physically validated with ALSA both closed and open. The 5.1 speaker test
+confirmed FL, FC, FR, SR, SL and LFE in their correct HDMI OUT positions while
+ALSA captured only FL/FR as designed. The 5.1 passthrough did not collapse to
+stereo when ALSA capture was active. 7.1 passthrough remains implemented but
+physically unvalidated.
+
+Both PCM devices expose a 120 KiB managed allocation by default, allowing from
+2 to 64 periods and from 960 to 30720 frames. A normal `arecord` invocation in
+the validation environment negotiated 50 periods, 24000 frames and a 500 ms
+buffer without a manual `/proc/asound` preallocation change or command-line
+buffer override. This describes the tested client negotiation, not a fixed
+latency imposed on every ALSA client.
+
+During link loss or dynamic stereo/surround format transitions, the PCM stream
+remains alive and supplies silence while the receiver relocks, then
+automatically restarts HDMI IN 1 audio DMA so live audio returns without closing
+the audio client or reselecting the source. On CachyOS `7.3.1-1-cachyos`, one
+35-second recording with active V4L2 survived 2.0 -> 5.1 -> 2.0 with no `-EIO`,
+`thread_error=0`, and measured recovery times of 138.6 ms and 120.8 ms. A 5.1
+physical disconnect/reconnect also returned video and audio on the same open
+descriptors. HDMI IN 2 passed a simultaneous V4L2 and stereo-audio smoke test
+with the same default managed-buffer behavior.
+
+Although the bridge EDID advertises the baseline CTA-861 LPCM sample rates
+(32/44.1/48 kHz) and no compressed audio formats, the FPGA capture path and
+ALSA constraints operate strictly at 48000 Hz LPCM; 32 kHz and 44.1 kHz LPCM
+sources (or forced non-LPCM bitstreams) are rejected by the capture path with a
+ratelimited kernel warning.
+
+Under the default `preserve` policy (`hdmi1_hotplug_policy=preserve`), connecting
+or disconnecting an HDMI OUT monitor never pulses upstream HPD or interrupts
+HDMI IN 1 capture. The internal 4K60 bridge EDID remains published and active
+video/audio capture continues completely uninterrupted. Under `renegotiate` mode,
+connecting an HDMI OUT monitor reads and publishes a compatible two-block EDID
+with a deliberate upstream HPD pulse to renegotiate with the source, while
+disconnecting HDMI OUT keeps the current capture mode without renegotiating.
 
 ## System suspend and resume
 
@@ -201,9 +269,10 @@ no application is recording it.
 
 OBS was the original target application and is useful as an integration test,
 but it is not required to use the driver. For a simultaneous test, add both
-V4L2 devices in the required HDMI IN 2 then HDMI IN 1 order, then select the
-two PulseAudio-compatible HDMI sources. This verifies that a streaming client
-can keep both video nodes and both desktop-audio sources active together.
+V4L2 devices (the physically validated order is HDMI IN 2 then HDMI IN 1),
+then select the two PulseAudio-compatible HDMI sources. This verifies that a
+streaming client can keep both video nodes and both desktop-audio sources
+active together.
 
 ## RGB enclosure lighting
 

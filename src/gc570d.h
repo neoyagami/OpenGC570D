@@ -50,6 +50,11 @@ const struct file_operations __name ## _fops = {                    \
 #define GC570D_SUBSYSTEM_ID       0x5700
 
 
+enum gc570d_hdmi1_hotplug_policy {
+	GC570D_HOTPLUG_PRESERVE = 0,
+	GC570D_HOTPLUG_RENEGOTIATE = 1,
+};
+
 extern bool auto_hdmi1;
 #define GC570D_BAR                0
 #define GC570D_EXPECTED_BAR_SIZE  SZ_512K
@@ -99,7 +104,6 @@ extern bool auto_hdmi1;
 #define GC570D_LED_BREATH_DELAY_MS 20
 
 #define GC570D_DMA_CHANNEL        1
-#define GC570D_DMA_FRAME_SIZE     (1920 * 1080 * 2)
 #define GC570D_DMA_BURST_FRAMES   4
 #define GC570D_DMA_STRESS_FRAMES  120
 #define GC570D_WIDTH              1920
@@ -119,7 +123,6 @@ extern bool auto_hdmi1;
 #define GC570D_DMA_SENTINEL       0xa5
 #define GC570D_NO_SIGNAL_WIDTH    640
 #define GC570D_NO_SIGNAL_HEIGHT   360
-#define GC570D_NO_SIGNAL_INTERVAL 166666
 
 #define GC570D_AUDIO_CHANNEL      1
 #define GC570D_AUDIO_FORMAT       0x0280
@@ -144,6 +147,7 @@ extern bool auto_hdmi1;
 #define GC570D_AUDIO_CHANNELS     2
 #define GC570D_AUDIO_PERIOD_FRAMES 480
 #define GC570D_AUDIO_PCM_BUFFER_MAX (GC570D_AUDIO_PERIOD_BYTES * 64)
+#define GC570D_AUDIO_WAIT_TIME_MS 500
 
 /* The official driver audio channel 0 is paired with HDMI IN 1 / DMA0. */
 #define GC570D_AUDIO0_CHANNEL       0
@@ -237,6 +241,7 @@ struct gc570d_video0_signal {
 	u16 frame_rate;
 	u8 working_mode;
 	u8 xilinx_mode;
+	bool interlaced;
 };
 
 struct gc570d_video0_format {
@@ -304,6 +309,13 @@ struct gc570d_dev {
 	__le32 *video_sg_cpu;
 	dma_addr_t video_sg_dma;
 	u32 video_sequence;
+	u16 video_width;
+	u16 video_height;
+	u32 video_frame_interval;
+	u16 video_input_width;
+	u16 video_input_height;
+	u16 video_input_frame_rate;
+	bool video_input_interlaced;
 	bool video_streaming;
 	bool video_stopping;
 	bool video_no_signal;
@@ -331,7 +343,11 @@ struct gc570d_dev {
 	u16 video0_width;
 	u16 video0_height;
 	u32 video0_frame_interval;
+	u16 video0_input_frame_rate;
+	bool video0_input_interlaced;
 	bool video0_receiver_output_valid;
+	bool video0_receiver_interlaced;
+	bool video0_reconfigure_pending;
 	u16 video0_receiver_width;
 	u16 video0_receiver_height;
 	u8 video0_receiver_input_color;
@@ -409,6 +425,7 @@ struct gc570d_dev {
 	bool splitter_video_stable_pending;
 	u8 splitter_channel_active_mask;
 	u8 splitter_video_stable_mask;
+	u8 splitter_worker_completed_mask;
 	u8 splitter_worker_state4_mask;
 	u8 splitter_eq_state;
 	u8 splitter_eq_retry;
@@ -423,8 +440,10 @@ struct gc570d_dev {
 	struct delayed_work hdmi1_auto_work;
 	u8 hdmi1_auto_phase;
 	bool hdmi1_auto_ready;
-	bool suspended;
+	enum gc570d_hdmi1_hotplug_policy hdmi1_hotplug_policy;
+	bool splitter_edid_published;
 	bool removing;
+	bool suspended;
 	struct led_classdev_mc led_mcdev;
 	struct mc_subled led_subleds[3];
 	struct mutex led_lock;
@@ -466,6 +485,7 @@ int gc570d_control_irq_wait(struct gc570d_dev *gc, u32 irq,
 irqreturn_t gc570d_irq_handler(int irq, void *data);
 int gc570d_it6802_audio_output_set(struct gc570d_dev *gc, bool enable);
 int gc570d_it6802_format_init(struct gc570d_dev *gc);
+int gc570d_it6802_frame_rate(struct gc570d_dev *gc, u16 *frame_rate);
 int gc570d_it6802_init(struct gc570d_dev *gc);
 int gc570d_it6802_link_status(struct gc570d_dev *gc, bool *source_5v,
 				       bool *scdt);
@@ -537,6 +557,9 @@ int gc570d_vip0_detect_signal(
 int gc570d_vip0_program_yuy2(
 	struct gc570d_dev *gc, const struct gc570d_video0_signal *signal,
 	u16 output_width, u16 output_height, u32 frame_interval);
+int gc570d_dma_detect_vip1_format(struct gc570d_dev *gc,
+				  u16 *width_out, u16 *height_out,
+				  bool *interlaced_out);
 int gc570d_vip_init(struct gc570d_dev *gc);
 int gc570d_xilinx_load_hdr_lut_3000(struct gc570d_dev *gc);
 int gc570d_xilinx_prepare_video0(

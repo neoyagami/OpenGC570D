@@ -33,12 +33,18 @@ rm -f /usr/local/sbin/gc570d-init-hdmi1
 rm -f /usr/local/sbin/gc570d-status
 rm -f /usr/local/bin/gc570d-setup-pipewire
 rm -f /usr/local/share/gc570d/51-gc570d.conf
+rm -f /usr/local/share/gc570d/gc570d.conf
 rm -f "$WIREPLUMBER_POLICY"
 rm -f "$SYSTEMD_UNIT"
+rmdir /etc/gc570d 2>/dev/null || true
 rmdir /usr/local/share/gc570d 2>/dev/null || true
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
 	systemctl daemon-reload
+fi
+
+if [ -f /etc/gc570d/gc570d.conf ]; then
+	echo "Preserved local configuration: /etc/gc570d/gc570d.conf"
 fi
 
 echo "Removed portable gc570d files for $KERNEL_RELEASE"

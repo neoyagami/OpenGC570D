@@ -53,24 +53,44 @@ Validated on the project hardware:
 | --- | --- |
 | HDMI IN 1 passthrough | 3840x2160p60 SDR and HDR; 2560x1440p60 SDR and HDR; 2560x1440p120 HDR |
 | HDMI IN 1 high-resolution capture | 2160p60 SDR/HDR, 1440p60 SDR/HDR and measured 1440p120 HDR input converted to 1920x1080 YUYV SDR at 60 fps |
-| HDMI IN 1 native capture | 1280x720p60 SDR input captured as 1280x720 YUYV at 60 fps; 720x480p59.94/60 SDR input from a RetroScaler2x captured as 720x480 YUYV and displayed at its intended 4:3 aspect ratio |
-| HDMI IN 2 capture | 1920x1080 YUYV at 60 fps |
-| HDMI IN 1 audio | `HDMI 1 (Passthrough)`, ALSA capture device 1, stereo S16_LE at 48 kHz; direct ALSA and PipeWire validated, including automatic recovery on the same open audio stream after disconnect/reconnect |
-| HDMI IN 2 audio | `HDMI 2 (Capture Only)`, ALSA capture device 0, stereo S16_LE at 48 kHz; direct ALSA and PipeWire validated |
+| HDMI IN 1 native and hardware-scaled capture | 1080p60 and 1080i60 SDR/HDR, plus 1024x768, 1280x720p60 SDR and 720x480p59.94/60 (or 640x480p60) SDR inputs captured at their native YUYV geometry; 1280x720p60 SDR/HDR is also physically validated hardware-scaled by VIP0 to 1920x1080p60 SDR. HDR inputs are tone mapped to SDR, `1080i` is reported as `V4L2_FIELD_INTERLACED`, and 720x480 is displayed at its intended 4:3 aspect ratio |
+| HDMI IN 2 capture | Discrete YUYV sizes from 640x480 to 1920x1080, captured natively from 1080p/1080i/720p/480p/1024x768 sources or hardware-scaled to the active V4L2 geometry through the VIP1 hardware scaler; cadence follows the source instead of the output size, so 50 Hz sources report 50 fps and 60 Hz sources report 60 fps |
+| HDMI IN 1 audio | `HDMI 1 (Passthrough)`, ALSA capture device 1, stereo S16_LE at 48 kHz. Stereo and 5.1 LPCM cold starts, the complete 5.1 speaker map on HDMI OUT, front-left/right ALSA capture during 5.1 passthrough, live 2.0/5.1 transitions and same-stream hotplug recovery are physically validated. The vendor bridge EDID also advertises 7.1 LPCM, which is implemented but not yet physically validated |
+| HDMI IN 2 audio | `HDMI 2 (Capture Only)`, ALSA capture device 0, stereo S16_LE at 48 kHz; direct ALSA and PipeWire validated, including capture with its V4L2 stream active and the default managed ALSA buffer |
 | Concurrent operation | Both V4L2 streams and both audio inputs active together through the tested ALSA/PipeWire path |
 | Hot-plug and disconnected inputs | Both V4L2 nodes concurrently supply the built-in generic no-signal frame at 1920x1080 YUYV/60 fps without video DMA; HDMI IN 1 and HDMI IN 2 each physically passed a complete live-to-placeholder-to-live cycle on the same open V4L2 stream, including HDMI IN 1 video and audio recovery while HDMI IN 2 remained active |
 | System suspend (S3/deep) | When idle, the driver quiesces the card and reinitializes the HDMI receivers, EDID/HPD handling and RGB controller after resume. HDMI IN 2 capture recovery was physically validated without reloading the module. An active V4L2 or prepared ALSA capture deliberately prevents system sleep with `-EBUSY`; active V4L2 blocking was physically validated |
 | RGB enclosure | Standard `gc570d:rgb:status` multicolor LED, fixed RGB, single-color breathing and red/yellow/green/cyan/blue/magenta/white breathing cycle |
 
 The 720x480 mode stores a 3:2 raster but represents 4:3 video through its
-non-square pixel aspect ratio. Testing also confirmed that only one client
-should negotiate the format of a V4L2 input at a time: multiple capture or
-PipeWire sources opened on the same input can request competing resolutions.
+non-square pixel aspect ratio. `VIDIOC_G_FMT` describes the configured capture
+buffers, not the detected input geometry: use `VIDIOC_S_FMT` with the source
+resolution to capture a sub-1080p HDMI IN 1 signal natively. Selecting
+1920x1080 for a 1280x720p60 SDR or HDR HDMI IN 1 source uses the VIP0 hardware
+scaler and has also been physically validated. HDR input is tone mapped to the
+SDR capture output. The driver does not report input geometry through
+`VIDIOC_G_FMT`.
+`VIDIOC_G_PARM` and `VIDIOC_ENUM_FRAMEINTERVALS` report the source cadence for
+the active input, independent of the chosen capture size; spatial VIP0/VIP1
+scaling does not convert frame rate. HDMI IN 1 normalizes measured receiver
+timing to the 24/25/30/50/60 Hz families with a ±3 Hz tolerance, so a nominal
+60 Hz source is reported as 60 fps even when integer timing arithmetic measures
+57–59 Hz, and caps higher-rate inputs at 60 fps. HDMI IN 2 decodes the CEA AVI
+VIC when the source provides one. The reported colorspace, YCbCr encoding,
+quantization, and transfer function describe the packed capture buffer rather
+than the HDMI source: HDR is tone mapped to SDR and source YCbCr is converted
+before the DMA output, so HD sizes report BT.709 limited range and SD sizes
+report BT.601 limited range. Testing also confirmed that only one client should
+negotiate the format of a V4L2 input at a time: multiple capture or PipeWire
+sources opened on the same input can request competing resolutions.
 
 Recovered but not yet fully validated: the remaining 1080p-or-lower input
-matrix, including 720x576, every source/monitor combination, VRR, and all
-advertised refresh rates. HDCP-protected content is unsupported. Capture
-output is SDR, capped at 60 fps, and no larger than 1920x1080.
+matrix, including 720x576/576p50 until a physical 50 Hz source is tested, every
+source/monitor combination, VRR, and all advertised refresh rates. 1080i uses
+the recovered hardware field handling: HDMI IN 1 exports both fields as
+`V4L2_FIELD_INTERLACED`, while HDMI IN 2 reconstructs a progressive frame.
+HDCP-protected content is unsupported. Capture output is SDR, capped at 60 fps,
+and no larger than 1920x1080.
 
 ## Driver roadmap
 
@@ -319,9 +339,12 @@ sudo ./scripts/gc570d-init-hdmi1.sh
 
 ## Simultaneous capture ordering
 
-Any application opening both V4L2 nodes must start HDMI IN 2 first and HDMI IN
-1 second. Direct ALSA clients can open `HDMI 2 (Capture Only)` and `HDMI 1
-(Passthrough)` independently. For desktop applications, the portable
+The two V4L2 nodes are independent and may be opened and started in either
+order. The driver preserves the shared VIP colour and bypass registers while
+the other channel is already streaming, so starting HDMI IN 1 first is no
+longer rejected. HDMI IN 2 first, then HDMI IN 1, remains the physically
+validated order. Direct ALSA clients can open `HDMI 2 (Capture Only)` and
+`HDMI 1 (Passthrough)` independently. For desktop applications, the portable
 installation publishes both sources automatically through PipeWire; when
 running from a checkout, run `setup-pipewire.sh`. OBS was used to validate this
 four-source arrangement as the original streaming target, but it is not

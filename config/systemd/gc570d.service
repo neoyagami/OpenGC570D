@@ -7,6 +7,8 @@ After=local-fs.target systemd-modules-load.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/gc570d/gc570d.conf
+EnvironmentFile=-/etc/default/gc570d
 ExecStart=/usr/local/sbin/gc570d-load
 RemainAfterExit=yes
 

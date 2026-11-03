@@ -45,6 +45,10 @@ echo
 echo "== Module =="
 if grep -q '^gc570d ' /proc/modules; then
 	grep '^gc570d ' /proc/modules
+	if [ -r /sys/module/gc570d/parameters/hdmi1_hotplug_policy ]; then
+		printf 'hdmi1_hotplug_policy: '
+		cat /sys/module/gc570d/parameters/hdmi1_hotplug_policy
+	fi
 else
 	echo "gc570d is not loaded"
 fi

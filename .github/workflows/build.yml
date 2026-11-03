@@ -59,7 +59,7 @@ jobs:
       - name: Install packaging dependencies
         run: |
           dnf -y --setopt=install_weak_deps=False install \
-            akmods findutils glibc-langpack-en kernel-core kernel-devel \
+            akmods findutils git glibc-langpack-en kernel-core kernel-devel \
             kmod kmodtool rpm-build rpmdevtools rpmlint
 
       - name: Check out source
@@ -71,8 +71,16 @@ jobs:
           rpm_topdir="$PWD/rpmbuild"
           mkdir -p "$rpm_topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           cp packaging/fedora/*.spec "$rpm_topdir/SPECS/"
-          spectool -g -C "$rpm_topdir/SOURCES" \
-            "$rpm_topdir/SPECS/gc570d-kmod.spec"
+          version=$(sed -n 's/^Version:[[:space:]]*//p' \
+            "$rpm_topdir/SPECS/gc570d-kmod.spec" | sed -n '1p')
+          if [ "$GITHUB_REF" = "refs/tags/v$version" ]; then
+            spectool -g -C "$rpm_topdir/SOURCES" \
+              "$rpm_topdir/SPECS/gc570d-kmod.spec"
+          else
+            git -c safe.directory="$PWD" archive --format=tar.gz \
+              --prefix="OpenGC570D-$version/" \
+              --output="$rpm_topdir/SOURCES/OpenGC570D-$version.tar.gz" HEAD
+          fi
           rpmbuild --define "_topdir $rpm_topdir" -ba \
             "$rpm_topdir/SPECS/gc570d-kmod.spec"
           rpmbuild --define "_topdir $rpm_topdir" -ba \

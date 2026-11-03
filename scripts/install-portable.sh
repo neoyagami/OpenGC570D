@@ -19,6 +19,7 @@ MODULE_DIR="/var/lib/gc570d/$KERNEL_RELEASE"
 MODULE_SELINUX_PATH='/var/lib/gc570d(/.*)?'
 SYSTEMD_UNIT=/etc/systemd/system/gc570d.service
 WIREPLUMBER_POLICY=/etc/wireplumber/wireplumber.conf.d/51-gc570d.conf
+CONFIG_FILE=/etc/gc570d/gc570d.conf
 
 make -C "$PROJECT_DIR" GC570D_DEVELOPER_DEBUGFS=0 || die "module build failed"
 install -D -m 0644 "$PROJECT_DIR/gc570d.ko" "$MODULE_DIR/gc570d.ko"
@@ -48,6 +49,13 @@ install -D -m 0644 "$PROJECT_DIR/config/wireplumber/51-gc570d.conf" \
 	/usr/local/share/gc570d/51-gc570d.conf
 install -D -m 0644 "$PROJECT_DIR/config/wireplumber/51-gc570d.conf" \
 	"$WIREPLUMBER_POLICY"
+install -D -m 0644 "$PROJECT_DIR/config/gc570d.conf" \
+	/usr/local/share/gc570d/gc570d.conf
+if [ ! -f "$CONFIG_FILE" ]; then
+	install -D -m 0644 "$PROJECT_DIR/config/gc570d.conf" \
+		"$CONFIG_FILE"
+	echo "Installed default configuration: $CONFIG_FILE"
+fi
 
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
 	install -D -m 0644 "$PROJECT_DIR/config/systemd/gc570d.service" \

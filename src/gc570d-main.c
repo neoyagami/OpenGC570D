@@ -10,6 +10,12 @@ module_param(auto_hdmi1, bool, 0444);
 MODULE_PARM_DESC(auto_hdmi1,
 		 "initialize HDMI IN 1 and passthrough automatically (default: true)");
 
+static char *hdmi1_hotplug_policy_param = "preserve";
+module_param_named(hdmi1_hotplug_policy, hdmi1_hotplug_policy_param, charp,
+		   0444);
+MODULE_PARM_DESC(hdmi1_hotplug_policy,
+		 "HDMI IN 1 hotplug policy: \"preserve\" (default) or \"renegotiate\"");
+
 static int gc570d_bridge_init(struct gc570d_dev *gc)
 {
 	/* Enter the same stopped state expected before the official driver initializes DMA. */
@@ -284,9 +290,9 @@ static void gc570d_hdmi1_auto_work(struct work_struct *work)
 
 	mutex_lock(&gc->capture_lock);
 	phase = gc->hdmi1_auto_phase;
-	if ((gc->video_streaming && !gc->video_no_signal) ||
-	    (gc->video0_streaming && !gc->video0_no_signal) ||
-	    READ_ONCE(gc->audio_prepared) || READ_ONCE(gc->audio0_prepared)) {
+	if ((gc->video0_streaming && !gc->video0_no_signal) ||
+	    (READ_ONCE(gc->audio0_running) &&
+	     !READ_ONCE(gc->audio0_recovering))) {
 		ret = -EBUSY;
 		reschedule = true;
 		goto out_unlock;
@@ -331,49 +337,82 @@ static void gc570d_hdmi1_auto_work(struct work_struct *work)
 		break;
 	case GC570D_HDMI1_AUTO_SOURCE:
 		ret = gc570d_splitter_source_power_event(gc, true);
-		if (!ret)
+		if (!ret || ret == -ENODATA || ret == -ENOLINK) {
+			ret = 0;
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_HDCP_OFF;
+		}
 		break;
 	case GC570D_HDMI1_AUTO_HDCP_OFF:
 		ret = gc570d_splitter_windows_receiver_hdcp_off(gc);
 		if (!ret) {
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_MAIN_TIMER;
-			next_delay = msecs_to_jiffies(1000);
+			next_delay = msecs_to_jiffies(500);
 		}
 		break;
 	case GC570D_HDMI1_AUTO_MAIN_TIMER:
 		ret = gc570d_splitter_main_timer_irq(gc);
-		if (!ret)
+		if (!ret || ret == -ENODATA) {
+			ret = 0;
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_CONNECT;
+		}
 		break;
 	case GC570D_HDMI1_AUTO_CONNECT:
-		ret = gc570d_splitter_windows_channel2_connect(gc, true);
-		if (!ret) {
+		ret = gc570d_splitter_windows_channel2_connect(gc,
+							       gc->hdmi1_hotplug_policy ==
+							       GC570D_HOTPLUG_PRESERVE);
+		if (!ret || ret == -ENOLINK || ret == -ENODATA) {
+			ret = 0;
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_RECEIVER_EVENT;
-			next_delay = msecs_to_jiffies(3000);
+			next_delay = msecs_to_jiffies(1500);
 		}
 		break;
 	case GC570D_HDMI1_AUTO_RECEIVER_EVENT:
 		ret = gc570d_splitter_source_power_event(gc, true);
 		if (!ret) {
+			gc->splitter_eq_retry = 0;
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_POST_TIMER;
-			next_delay = msecs_to_jiffies(3000);
+			next_delay = msecs_to_jiffies(1500);
+		} else if ((ret == -ENODATA || ret == -ENOLINK) &&
+			   (gc->splitter_video_stable_pending ||
+			    ++gc->splitter_eq_retry >= 4)) {
+			gc->splitter_eq_retry = 0;
+			ret = 0;
+			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_POST_TIMER;
+			next_delay = msecs_to_jiffies(200);
 		}
 		break;
 	case GC570D_HDMI1_AUTO_POST_TIMER:
 		ret = gc570d_splitter_main_timer_irq(gc);
-		if (!ret)
+		if (!ret || ret == -ENODATA) {
+			ret = 0;
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_STABLE_IRQ;
+		}
 		break;
 	case GC570D_HDMI1_AUTO_STABLE_IRQ:
 		ret = gc570d_splitter_channel_video_stable_irq(gc);
-		if (!ret)
+		if (ret == -ENOLINK || ret == -ENODATA ||
+		    (ret == -EAGAIN && ++gc->splitter_eq_retry >= 3)) {
+			gc->splitter_eq_retry = 0;
+			dev_info(&gc->pdev->dev,
+				 "No passthrough sink stable yet; starting state pump for standalone HDMI IN 1 capture\n");
+			gc->hdmi1_auto_phase = gc->splitter_video_stable_pending ?
+				GC570D_HDMI1_AUTO_WORKERS : GC570D_HDMI1_AUTO_PUMP;
+			ret = 0;
+		} else if (!ret || ret == -EALREADY) {
+			gc->splitter_eq_retry = 0;
+			ret = 0;
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_WORKER_PROBE;
+		}
 		break;
 	case GC570D_HDMI1_AUTO_WORKER_PROBE:
 		ret = gc570d_splitter_stable_worker_probe(gc);
-		if (!ret)
+		if (ret == -ENOLINK || ret == -ENODATA) {
+			gc->hdmi1_auto_phase = gc->splitter_video_stable_pending ?
+				GC570D_HDMI1_AUTO_WORKERS : GC570D_HDMI1_AUTO_PUMP;
+			ret = 0;
+		} else if (!ret) {
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_WORKERS;
+		}
 		break;
 	case GC570D_HDMI1_AUTO_WORKERS:
 		ret = gc570d_splitter_stable_workers_windows_order(gc);
@@ -385,7 +424,9 @@ static void gc570d_hdmi1_auto_work(struct work_struct *work)
 		if (!ret || ret == -EALREADY) {
 			ret = 0;
 			gc->hdmi1_auto_phase = GC570D_HDMI1_AUTO_READY;
-			gc->hdmi1_auto_ready = true;
+			WRITE_ONCE(gc->hdmi1_auto_ready, true);
+			wake_up_interruptible(&gc->video0_wait);
+			wake_up_interruptible(&gc->audio0_wait);
 			dev_info(&gc->pdev->dev,
 				 "HDMI IN 1 and passthrough automatic initialization completed\n");
 		}
@@ -488,6 +529,16 @@ static int gc570d_probe(struct pci_dev *pdev,
 				     "failed to map BAR0\n");
 
 	gc->pdev = pdev;
+	if (!hdmi1_hotplug_policy_param ||
+	    !strcmp(hdmi1_hotplug_policy_param, "preserve")) {
+		gc->hdmi1_hotplug_policy = GC570D_HOTPLUG_PRESERVE;
+	} else if (!strcmp(hdmi1_hotplug_policy_param, "renegotiate")) {
+		gc->hdmi1_hotplug_policy = GC570D_HOTPLUG_RENEGOTIATE;
+	} else {
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "invalid hdmi1_hotplug_policy '%s' (expected 'preserve' or 'renegotiate')\n",
+				     hdmi1_hotplug_policy_param);
+	}
 	mutex_init(&gc->i2c_lock);
 	mutex_init(&gc->capture_lock);
 	mutex_init(&gc->video_lock);
@@ -518,6 +569,9 @@ static int gc570d_probe(struct pci_dev *pdev,
 	atomic_set(&gc->control_irq_seen, 0);
 	atomic_set(&gc->audio_irq_pending, 0);
 	atomic_set(&gc->audio0_irq_pending, 0);
+	gc->video_width = 1920;
+	gc->video_height = 1080;
+	gc->video_frame_interval = 166666;
 	gc->video0_width = 1920;
 	gc->video0_height = 1080;
 	gc->video0_frame_interval = 166666;
@@ -900,9 +954,11 @@ static int gc570d_probe(struct pci_dev *pdev,
 #endif
 
 	dev_info(&pdev->dev,
-		 "probe complete: BAR0 %pr mapped at %pR, HDMI IN 1 automatic initialization=%s\n",
+		 "probe complete: BAR0 %pr mapped at %pR, HDMI IN 1 automatic initialization=%s, policy=%s\n",
 		 &pdev->resource[GC570D_BAR], &pdev->resource[GC570D_BAR],
-		 auto_hdmi1 ? "on" : "off");
+		 auto_hdmi1 ? "on" : "off",
+		 gc->hdmi1_hotplug_policy == GC570D_HOTPLUG_PRESERVE ?
+		 "preserve" : "renegotiate");
 	if (auto_hdmi1)
 		schedule_delayed_work(&gc->hdmi1_auto_work, 0);
 
@@ -918,12 +974,14 @@ static void gc570d_reset_resume_state(struct gc570d_dev *gc)
 	gc->splitter_video_stable_pending = false;
 	gc->splitter_channel_active_mask = 0;
 	gc->splitter_video_stable_mask = 0;
+	gc->splitter_worker_completed_mask = 0;
 	gc->splitter_worker_state4_mask = 0;
 	gc->splitter_eq_state = 0;
 	gc->splitter_eq_retry = 0;
 	memset(gc->splitter_pclk, 0, sizeof(gc->splitter_pclk));
 	memset(gc->splitter_vclk, 0, sizeof(gc->splitter_vclk));
 	gc->splitter_receiver_hdcp_off = false;
+	gc->splitter_edid_published = false;
 	gc->video0_receiver_output_valid = false;
 	gc->video0_receiver_width = 0;
 	gc->video0_receiver_height = 0;

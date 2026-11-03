@@ -654,6 +654,8 @@ static int gc570d_audio_pcm_open(struct snd_pcm_substream *substream)
 	int ret;
 
 	substream->runtime->hw = gc570d_audio_pcm_hardware;
+	/* Allow a transient DMA pause without failing a blocking reader. */
+	substream->wait_time = GC570D_AUDIO_WAIT_TIME_MS;
 	ret = snd_pcm_hw_constraint_integer(substream->runtime,
 					    SNDRV_PCM_HW_PARAM_PERIODS);
 	return ret;
@@ -912,11 +914,16 @@ int gc570d_audio0_recover_locked(struct gc570d_dev *gc)
 	int i;
 	int ret;
 
-	if (!READ_ONCE(gc->audio0_prepared) ||
+	if (READ_ONCE(gc->suspended) || !READ_ONCE(gc->audio0_prepared) ||
 	    !READ_ONCE(gc->audio0_running) ||
 	    !READ_ONCE(gc->audio0_recovering))
 		return 0;
 
+	if (!READ_ONCE(gc->video0_streaming)) {
+		ret = gc570d_it68051_video_output_on(gc);
+		if (ret)
+			return ret;
+	}
 	ret = gc570d_it68051_audio_output_set(gc, true);
 	if (ret)
 		return ret;
@@ -932,6 +939,7 @@ int gc570d_audio0_recover_locked(struct gc570d_dev *gc)
 		memset(gc->audio0_pcm_buffer_cpu[i], GC570D_AUDIO_SENTINEL,
 		       GC570D_AUDIO_BUFFER_SIZE);
 	writel(0, gc->bar0 + GC570D_AUDIO0_FORMAT);
+	writel(0, gc->bar0 + GC570D_AUDIO_GLOBAL_FORMAT);
 	writel(GC570D_AUDIO_PERIOD_FRAMES, gc->bar0 + GC570D_AUDIO0_RATE);
 	writel(lower_32_bits(gc->audio0_pcm_buffer_dma[0]),
 	       gc->bar0 + GC570D_AUDIO0_BUFFER0);
@@ -1005,7 +1013,15 @@ static int gc570d_audio0_pcm_thread(void *data)
 		if (kthread_should_stop())
 			break;
 		if (READ_ONCE(gc->audio0_recovering)) {
-			if (!READ_ONCE(gc->video0_no_signal) &&
+			/* Keep ALSA moving before synchronous receiver recovery. */
+			memset(period, 0, sizeof(period));
+			ret = gc570d_audio0_pcm_push_period(gc, period);
+			if (ret)
+				goto xrun;
+
+			if ((!READ_ONCE(gc->video0_streaming) ||
+			     (!READ_ONCE(gc->video0_no_signal) &&
+			      READ_ONCE(gc->video0_receiver_output_valid))) &&
 			    time_after_eq(jiffies, next_recovery) &&
 			    mutex_trylock(&gc->capture_lock)) {
 				ret = gc570d_audio0_recover_locked(gc);
@@ -1014,10 +1030,6 @@ static int gc570d_audio0_pcm_thread(void *data)
 					continue;
 				next_recovery = jiffies + msecs_to_jiffies(250);
 			}
-			memset(period, 0, sizeof(period));
-			ret = gc570d_audio0_pcm_push_period(gc, period);
-			if (ret)
-				goto xrun;
 			usleep_range(9500, 10500);
 			continue;
 		}
@@ -1025,12 +1037,14 @@ static int gc570d_audio0_pcm_thread(void *data)
 		ret = readl_poll_timeout(gc->bar0 + GC570D_REG_IRQ_STATUS,
 					 irq_status,
 					 (irq_status & GC570D_AUDIO0_IRQ) ||
-					 atomic_read(&gc->audio0_irq_pending),
+					 atomic_read(&gc->audio0_irq_pending) ||
+					 READ_ONCE(gc->audio0_recovering),
 					 100, 100000);
 		if (!READ_ONCE(gc->audio0_running))
 			continue;
-		if (ret) {
-			gc->audio0_thread_error = ret;
+		if (ret || READ_ONCE(gc->audio0_recovering)) {
+			if (ret)
+				gc->audio0_thread_error = ret;
 			WRITE_ONCE(gc->audio0_recovering, true);
 			atomic_set(&gc->audio0_irq_pending, 0);
 			writel(readl(gc->bar0 + GC570D_AUDIO_START) &
@@ -1085,6 +1099,8 @@ static int gc570d_audio0_pcm_open(struct snd_pcm_substream *substream)
 	int ret;
 
 	substream->runtime->hw = gc570d_audio_pcm_hardware;
+	/* Receiver reconfiguration may take longer than ALSA's minimum wait. */
+	substream->wait_time = GC570D_AUDIO_WAIT_TIME_MS;
 	ret = snd_pcm_hw_constraint_integer(substream->runtime,
 					    SNDRV_PCM_HW_PARAM_PERIODS);
 	return ret;
@@ -1168,43 +1184,62 @@ static int gc570d_audio0_pcm_hw_free(struct snd_pcm_substream *substream)
 	return snd_pcm_lib_free_pages(substream);
 }
 
+static bool gc570d_audio0_is_no_signal_error(int ret)
+{
+	return ret == -ENOLINK || ret == -ENODATA || ret == -EAGAIN ||
+	       ret == -ERANGE || ret == -EINVAL || ret == -EILSEQ ||
+	       ret == -EOPNOTSUPP;
+}
+
 static int gc570d_audio0_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct gc570d_dev *gc = snd_pcm_substream_chip(substream);
+	bool recovering = false;
 	int i;
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&gc->capture_lock);
 	if (READ_ONCE(gc->suspended)) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
-	if (gc->audio0_prepared) {
-		ret = 0;
-		gc->audio0_pcm_pos = 0;
-		goto out_unlock;
-	}
 	if (!gc->video0_streaming) {
 		ret = gc570d_it68051_video_output_on(gc);
-		if (ret)
+		if (ret && gc570d_audio0_is_no_signal_error(ret)) {
+			recovering = true;
+			ret = 0;
+		} else if (ret) {
 			goto out_unlock;
-	}
-	ret = gc570d_it68051_audio_output_set(gc, true);
-	if (ret)
-		goto out_unlock;
-	for (i = 0; i < 2; i++) {
-		gc->audio0_pcm_buffer_cpu[i] =
-			dma_alloc_coherent(&gc->pdev->dev,
-					   GC570D_AUDIO_BUFFER_SIZE,
-					   &gc->audio0_pcm_buffer_dma[i],
-					   GFP_KERNEL);
-		if (!gc->audio0_pcm_buffer_cpu[i]) {
-			ret = -ENOMEM;
-			goto out_free;
 		}
+	} else if (READ_ONCE(gc->video0_no_signal) ||
+		   !READ_ONCE(gc->video0_receiver_output_valid)) {
+		recovering = true;
+	}
+	if (!recovering) {
+		ret = gc570d_it68051_audio_output_set(gc, true);
+		if (ret && gc570d_audio0_is_no_signal_error(ret)) {
+			recovering = true;
+			ret = 0;
+		} else if (ret) {
+			goto out_unlock;
+		}
+	}
+	if (!gc->audio0_prepared) {
+		for (i = 0; i < 2; i++) {
+			gc->audio0_pcm_buffer_cpu[i] =
+				dma_alloc_coherent(&gc->pdev->dev,
+						   GC570D_AUDIO_BUFFER_SIZE,
+						   &gc->audio0_pcm_buffer_dma[i],
+						   GFP_KERNEL);
+			if (!gc->audio0_pcm_buffer_cpu[i]) {
+				ret = -ENOMEM;
+				goto out_free;
+			}
+		}
+	}
+	for (i = 0; i < 2; i++)
 		memset(gc->audio0_pcm_buffer_cpu[i], GC570D_AUDIO_SENTINEL,
 		       GC570D_AUDIO_BUFFER_SIZE);
-	}
 
 	gc570d_reset_audio_channel(gc, GC570D_AUDIO0_CHANNEL);
 	writel(GC570D_AUDIO0_IRQ | GC570D_AUDIO0_TERM_IRQ,
@@ -1224,9 +1259,13 @@ static int gc570d_audio0_pcm_prepare(struct snd_pcm_substream *substream)
 
 	gc->audio0_pcm_pos = 0;
 	gc->audio0_thread_error = 0;
-	WRITE_ONCE(gc->audio0_recovering, false);
+	WRITE_ONCE(gc->audio0_recovering, recovering);
 	atomic_set(&gc->audio0_irq_pending, 0);
 	gc->audio0_substream = substream;
+	if (gc->audio0_prepared) {
+		mutex_unlock(&gc->capture_lock);
+		return 0;
+	}
 	gc->audio0_prepared = true;
 	pci_set_master(gc->pdev);
 	gc570d_video_irq_get_locked(gc);
@@ -1279,13 +1318,15 @@ static int gc570d_audio0_pcm_trigger(struct snd_pcm_substream *substream,
 		atomic_set(&gc->audio0_irq_pending, 0);
 		writel(GC570D_AUDIO0_IRQ | GC570D_AUDIO0_TERM_IRQ,
 		       gc->bar0 + GC570D_REG_IRQ_STATUS);
-		gc->audio0_term_baseline = atomic64_read(&gc->irq_audio0_term);
-		gc->audio0_stop_pending = true;
+		if (!READ_ONCE(gc->audio0_recovering)) {
+			gc->audio0_term_baseline =
+				atomic64_read(&gc->irq_audio0_term);
+			gc->audio0_stop_pending = true;
+			control = readl(gc->bar0 + GC570D_AUDIO_START);
+			writel(control | GC570D_AUDIO0_START_BIT,
+			       gc->bar0 + GC570D_AUDIO_START);
+		}
 		WRITE_ONCE(gc->audio0_running, true);
-		WRITE_ONCE(gc->audio0_recovering, false);
-		control = readl(gc->bar0 + GC570D_AUDIO_START);
-		writel(control | GC570D_AUDIO0_START_BIT,
-		       gc->bar0 + GC570D_AUDIO_START);
 		wake_up_interruptible(&gc->audio0_wait);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -1349,9 +1390,10 @@ int gc570d_audio_register(struct gc570d_dev *gc)
 	strscpy(pcm->name, "HDMI 2 (Capture Only)", sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE,
 			&gc570d_audio_pcm_ops);
+	/* ALSA clamps buffer_bytes_max to each managed preallocation size. */
 	ret = snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC,
 					     NULL,
-					     2 * GC570D_AUDIO_PERIOD_BYTES,
+					     GC570D_AUDIO_PCM_BUFFER_MAX,
 					     GC570D_AUDIO_PCM_BUFFER_MAX);
 	if (ret)
 		return ret;
@@ -1365,7 +1407,7 @@ int gc570d_audio_register(struct gc570d_dev *gc)
 			&gc570d_audio0_pcm_ops);
 	ret = snd_pcm_set_managed_buffer_all(pcm0, SNDRV_DMA_TYPE_VMALLOC,
 					     NULL,
-					     2 * GC570D_AUDIO_PERIOD_BYTES,
+					     GC570D_AUDIO_PCM_BUFFER_MAX,
 					     GC570D_AUDIO_PCM_BUFFER_MAX);
 	if (ret)
 		return ret;

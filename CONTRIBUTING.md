@@ -81,8 +81,48 @@ For code changes:
 3. Preserve the validated HDMI IN 2 path unless the change explicitly targets
    and tests it.
 4. For concurrent video, test HDMI IN 2 STREAMON before HDMI IN 1.
-5. Run `make`, `make check`, and `git diff --check`.
+5. Run the compilation, repository and style checks described below.
 6. Separate a static-analysis conclusion from a physical hardware result.
+
+### Code review checks
+
+Contributors and reviewers must use the same baseline before a driver change is
+merged into `dev`. Run these commands from a clean checkout with the target
+kernel build files installed:
+
+```sh
+make W=1
+make check
+git diff --check
+```
+
+Kernel source changes must also pass the target kernel's `checkpatch.pl` in
+strict mode. For a feature branch targeting `dev`, run:
+
+```sh
+CHECKPATCH=/lib/modules/$(uname -r)/build/scripts/checkpatch.pl
+git diff --no-ext-diff --unified=80 origin/dev...HEAD -- \
+  'src/*.c' 'src/*.h' | "$CHECKPATCH" --no-tree --strict -
+```
+
+Use the actual target branch instead of `origin/dev` for an urgent fix aimed at
+`main`. New errors, warnings or strict checks must be corrected or explicitly
+explained in the pull request when hardware timing requires a deliberate
+exception. A check that is a verified false positive should still be avoided
+when a clearer equivalent comment or layout removes it without changing
+behavior.
+
+`make check` validates POSIX shell syntax, packaging and release contents. When
+a contribution changes the systemd unit, also run:
+
+```sh
+systemd-analyze verify config/systemd/gc570d.service
+```
+
+Keep shell commands readable and wrap newly added lines at approximately 100
+columns. The review must record which checks were run, distinguish environmental
+tool warnings from source warnings, and leave the worktree clean after generated
+build files are removed with `make clean`.
 
 AI-assisted contributions are welcome when disclosed. The contributor remains
 responsible for reviewing and testing the submitted work.
